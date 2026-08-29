@@ -1,0 +1,48 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Standalone Windows Executable
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Build Executable with PyInstaller
+      run: |
+        python package.py
+
+    - name: Prepare Deployment Package
+      run: |
+        mkdir deploy
+        copy dist\ReportGenerator.exe deploy\
+        copy config.yaml deploy\
+        copy run_reporter.bat deploy\
+        copy schema.sql deploy\
+        copy README.md deploy\
+
+    - name: Upload Deployment Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ReportGenerator-Windows-Deployment
+        path: deploy/
+        if-no-files-found: error

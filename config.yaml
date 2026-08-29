@@ -1,0 +1,180 @@
+# Database Connection Configuration
+database:
+  driver: "ODBC Driver 17 for SQL Server"
+  server: "LOCALHOST\\SQLEXPRESS"
+  database: "PlantDB"
+  username: ""
+  password: ""
+  trusted_connection: true  # Set to true to use Windows Authentication
+  fallback_to_sqlite: true  # Fallback to SQLite if SQL Server connection fails
+  sqlite_db_path: "mock_plant.db"
+
+# Report Output Settings
+reporting:
+  output_dir: "./reports"
+  template_title: "BATCHING REPORT (SHIFT WISE)"
+  excel_gridlines: true
+  header_row: 5
+  data_start_row: 6
+
+# Shift Configurations
+# - Shifts run daily at the specified run_time.
+# - start_time and end_time define the query window for that shift.
+# - start_day_offset: 0 for current day, -1 for previous day.
+# - end_day_offset: 0 for current day, -1 for previous day.
+shifts:
+  - name: "Shift A"
+    run_time: "14:05"  # Scheduled run time. (Configurable. Note: 14:05 PM is 5 min after Shift A ends)
+    start_time: "06:00:00"
+    start_day_offset: 0
+    end_time: "14:00:00"
+    end_day_offset: 0
+    description: "Shift A covers 6 AM to 2 PM on the current day."
+
+  - name: "Shift B"
+    run_time: "22:05"
+    start_time: "14:00:00"
+    start_day_offset: 0
+    end_time: "22:00:00"
+    end_day_offset: 0
+    description: "Shift B covers 2 PM to 10 PM on the current day."
+
+  - name: "Shift C"
+    run_time: "06:05"
+    start_time: "22:00:00"
+    start_day_offset: -1
+    end_time: "06:00:00"
+    end_day_offset: 0
+    description: "Shift C covers 10 PM of the previous day to 6 AM of the current day."
+
+  - name: "Daily"
+    run_time: "00:05"
+    start_time: "00:00:00"
+    start_day_offset: -1
+    end_time: "00:00:00"
+    end_day_offset: 0
+    description: "Daily report covers 12 AM of the previous day to 12 AM of the current day (24 hours)."
+
+# Column Mapping and Layout Configuration
+# - excel_col: The Excel column letter to write the data to.
+# - db_field: The name of the field returned by the SQL query.
+# - excel_header: The display header text in the Excel report.
+# - type: Data type (int, float, datetime, string).
+# - format: Format string for values.
+# - sum_summary: If true, calculates and prints a sum row at the bottom.
+# - avg_summary: If true, calculates and prints an average row at the bottom.
+columns:
+  - excel_col: "B"
+    db_field: "batch_no"
+    excel_header: "BATCH NO."
+    type: "int"
+    format: "0"
+
+  - excel_col: "D"
+    db_field: "batching_time"
+    excel_header: "BATCHING TIME"
+    type: "datetime"
+    format: "DD-MM-YY-HH:MM:SS"
+
+  - excel_col: "F"
+    db_field: "empty_val_1"
+    excel_header: "EMPTY"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "H"
+    db_field: "wst_bqt_h_1"
+    excel_header: "WST BQT H"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "J"
+    db_field: "qtz"
+    excel_header: "QTZ"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "L"
+    db_field: "wst_bqt_h_2"
+    excel_header: "WST BQT H"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "N"
+    db_field: "empty_val_2"
+    excel_header: "EMPTY"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "P"
+    db_field: "an_coal"
+    excel_header: "AN COAL"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "R"
+    db_field: "wst_bqt_h_3"
+    excel_header: "WST BQT H"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "T"
+    db_field: "harfer_cok"
+    excel_header: "HARFER COK"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "V"
+    db_field: "wst_bqt_l"
+    excel_header: "WST BQT L"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+  - excel_col: "X"
+    db_field: "wst_fbl"
+    excel_header: "WST FBL"
+    type: "float"
+    format: "0.00"
+    avg_summary: true
+
+# OPC DA Connection and Data Acquisition Settings
+opc:
+  enabled: true
+  server: "ABB.DriveOPC"
+  host: "localhost"
+  polling_interval_seconds: 10
+  
+  # Trigger configuration:
+  # - trigger_mode: "batch_no_change" (writes when batch_no tag increments)
+  #                 "trigger_tag" (writes when trigger_tag transitions from 0 to 1)
+  #                 "periodic" (writes data at polling_interval_seconds)
+  trigger_mode: "periodic"
+  trigger_tag: "ABB_Drive.BatchComplete"
+  
+  # Tag mapping for the SQL Server table columns
+  tag_mappings:
+    batch_no: "ABB_Drive.BatchNo"
+    empty_val_1: "ABB_Drive.EmptyVal1"
+    wst_bqt_h_1: "ABB_Drive.WstBqtH1"
+    qtz: "ABB_Drive.Qtz"
+    wst_bqt_h_2: "ABB_Drive.WstBqtH2"
+    empty_val_2: "ABB_Drive.EmptyVal2"
+    an_coal: "ABB_Drive.AnCoal"
+    wst_bqt_h_3: "ABB_Drive.WstBqtH3"
+    harfer_cok: "ABB_Drive.HarferCok"
+    wst_bqt_l: "ABB_Drive.WstBqtL"
+    wst_fbl: "ABB_Drive.WstFbl"
+  
+  # Simulation mode settings (generates mock batches for testing)
+  simulation:
+    enabled: true
+    interval_seconds: 15

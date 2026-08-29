@@ -1,0 +1,7 @@
+pyodbc>=4.0.30
+pandas>=1.5.0
+openpyxl>=3.0.10
+pyyaml>=6.0
+schedule>=1.2.0
+pywin32>=304; sys_platform == "win32"
+pyinstaller>=5.0.0
