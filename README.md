@@ -29,24 +29,65 @@ pip install -r requirements.txt
 
 ---
 
-## Testing Offline (No SQL Server Connection Required)
+## Database Setup & Mock Data Generation
 
-To verify the report formats and schedules instantly:
+### 1. SQLite Setup (Offline / Local Testing)
+You can set up SQLite in three ways:
 
-1. **Initialize the Mock SQLite database:**
-   ```cmd
-   python mock_db_setup.py
-   ```
-   This creates a local database file `mock_plant.db` and populates it with realistic batch records, including records on the historical date `2026-05-15` (to replicate the exact data in the sample screenshot).
+- **Via Python Mock Processor (Recommended):**
+  ```cmd
+  python mock_db_setup.py --sqlite
+  ```
+  This creates `mock_plant.db`, initializes tables/indexes, and generates realistic batch data for the last 7 days + benchmark date `2026-05-15`.
 
-2. **Generate a Shift Report:**
+- **Via SQLite CLI (`.read`):**
+  ```cmd
+  sqlite3 mock_plant.db
+  sqlite> .read schema.sql
+  ```
+  [schema.sql](file:///Users/rohitkumar/IdeaProjects/ReportGen-Plant/schema.sql) is fully SQLite-compatible with table definitions, index, and sample data.
+
+- **Via Main CLI:**
+  ```cmd
+  python main.py --init-db
+  python main.py --mock-data
+  ```
+
+### 2. SQL Server Setup (Production / SSMS)
+- **Via SQL Script in SSMS:**
+  Open [schema_sqlserver.sql](file:///Users/rohitkumar/IdeaProjects/ReportGen-Plant/schema_sqlserver.sql) in SQL Server Management Studio (SSMS) against your database (e.g., `PlantDB`) and execute.
+- **Via Python Processor:**
+  ```cmd
+  python mock_db_setup.py --sqlserver --init-only
+  python mock_db_setup.py --sqlserver --days 7
+  ```
+
+### 3. Additional Mock Data Tools
+- **Live Stream Batches (Continuous Ingestion Simulation):**
+  ```cmd
+  python mock_db_setup.py --stream --interval 10
+  ```
+- **Check Database Stats:**
+  ```cmd
+  python mock_db_setup.py --stats
+  ```
+- **Generate Specific Date Range:**
+  ```cmd
+  python mock_db_setup.py --start-date 2026-05-01 --end-date 2026-05-15
+  ```
+
+---
+
+## Testing Reports
+
+1. **Generate a Shift Report:**
    ```cmd
    python main.py --run-shift "Shift A" --date 2026-05-15
    ```
-   This will query the database for the window `2026-05-15 06:00:00` to `2026-05-15 14:00:00` and generate the report inside the `./reports` directory.
+   This queries the database for `2026-05-15 06:00:00` to `2026-05-15 14:00:00` and outputs the Excel report in `./reports`.
 
-3. **Check the Interactive Menu:**
-   Double-click `run_reporter.bat` to launch the console dashboard menu where you can generate shift reports, start the service, or initialize the mock DB.
+2. **Interactive Windows Console Dashboard:**
+   Double-click [run_reporter.bat](file:///Users/rohitkumar/IdeaProjects/ReportGen-Plant/run_reporter.bat) for an interactive menu to initialize databases, populate mock data, run shift reports, or start background services.
 
 ---
 

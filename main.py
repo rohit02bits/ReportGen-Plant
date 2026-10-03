@@ -87,6 +87,10 @@ Examples:
     parser.add_argument("--dry-run", action="store_true", help="Use with --service to test scheduler setup without waiting")
     parser.add_argument("--collect-opc", action="store_true", help="Start the continuous OPC DA data collection service")
     parser.add_argument("--opc-sim", action="store_true", help="Force OPC DA client into simulation/mock mode")
+    parser.add_argument("--init-db", action="store_true", help="Initialize database schema, tables, and indexes")
+    parser.add_argument("--mock-data", action="store_true", help="Generate and insert mock plant batch data into the connected database")
+    parser.add_argument("--mock-days", type=int, default=7, help="Number of past days for mock data generation (default: 7)")
+    parser.add_argument("--db-stats", action="store_true", help="Display record count and statistics for the connected database")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Set the logging detail level (default: INFO)")
 
     args = parser.parse_args()
@@ -122,7 +126,28 @@ Examples:
     scheduler = Scheduler(config)
 
     # Route execution based on CLI args
-    if args.run_shift:
+    if args.init_db:
+        from db_client import DatabaseClient
+        db = DatabaseClient(config)
+        logger.info("Initializing database tables and schema...")
+        db.init_schema()
+        logger.info("Database tables initialized successfully.")
+
+    elif args.mock_data:
+        from mock_db_setup import setup_and_populate_db
+        logger.info(f"Generating mock batch records for {args.mock_days} days...")
+        setup_and_populate_db(config, target_engine="auto", days=args.mock_days, specific_date=args.date)
+        logger.info("Mock data generated and inserted successfully.")
+
+    elif args.db_stats:
+        from db_client import DatabaseClient
+        db = DatabaseClient(config)
+        stats = db.get_stats()
+        print("\nDatabase Status Summary:")
+        for k, v in stats.items():
+            print(f"  • {k}: {v}")
+
+    elif args.run_shift:
         try:
             scheduler.run_shift_report(args.run_shift, target_date)
             logger.info("Report execution completed successfully.")

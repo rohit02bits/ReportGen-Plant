@@ -1,36 +1,44 @@
 -- ============================================================================
--- SQLite Database Schema Setup for Plant Batching Report
+-- SQL Server (T-SQL) Database Schema Setup for Plant Batching Report
 -- ============================================================================
--- Can be executed in SQLite command line:
--- sqlite3 mock_plant.db < schema.sql
--- or from inside sqlite prompt: sqlite> .read schema.sql
--- ============================================================================
+-- Execute this script in SQL Server Management Studio (SSMS) on your target database
+-- (e.g. PlantDB) to create the batching_data table and insert sample records.
 
 -- 1. Create Table
-CREATE TABLE IF NOT EXISTS batching_data (
-    batch_no INTEGER NOT NULL,
-    batching_time TEXT NOT NULL,
-    empty_val_1 REAL DEFAULT 0.00,
-    wst_bqt_h_1 REAL DEFAULT 0.00,
-    qtz REAL DEFAULT 0.00,
-    wst_bqt_h_2 REAL DEFAULT 0.00,
-    empty_val_2 REAL DEFAULT 0.00,
-    an_coal REAL DEFAULT 0.00,
-    wst_bqt_h_3 REAL DEFAULT 0.00,
-    harfer_cok REAL DEFAULT 0.00,
-    wst_bqt_l REAL DEFAULT 0.00,
-    wst_fbl REAL DEFAULT 0.00
-);
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[batching_data]') AND type in (N'U'))
+BEGIN
+    CREATE TABLE [dbo].[batching_data](
+        [batch_no] [int] NOT NULL,
+        [batching_time] [datetime] NOT NULL,
+        [empty_val_1] [decimal](18, 2) NULL DEFAULT 0.00,
+        [wst_bqt_h_1] [decimal](18, 2) NULL DEFAULT 0.00,
+        [qtz] [decimal](18, 2) NULL DEFAULT 0.00,
+        [wst_bqt_h_2] [decimal](18, 2) NULL DEFAULT 0.00,
+        [empty_val_2] [decimal](18, 2) NULL DEFAULT 0.00,
+        [an_coal] [decimal](18, 2) NULL DEFAULT 0.00,
+        [wst_bqt_h_3] [decimal](18, 2) NULL DEFAULT 0.00,
+        [harfer_cok] [decimal](18, 2) NULL DEFAULT 0.00,
+        [wst_bqt_l] [decimal](18, 2) NULL DEFAULT 0.00,
+        [wst_fbl] [decimal](18, 2) NULL DEFAULT 0.00
+    ) ON [PRIMARY]
+END
+GO
 
--- 2. Create Index on batching_time for fast date/time range queries
-CREATE INDEX IF NOT EXISTS IX_batching_data_batching_time 
-ON batching_data (batching_time ASC);
+-- 2. Create Clustered/Non-Clustered Indexes for optimization
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'IX_batching_data_batching_time' AND object_id = OBJECT_ID(N'[dbo].[batching_data]'))
+BEGIN
+    CREATE NONCLUSTERED INDEX [IX_batching_data_batching_time] 
+    ON [dbo].[batching_data] ([batching_time] ASC)
+    INCLUDE ([batch_no], [empty_val_1], [wst_bqt_h_1], [qtz], [wst_bqt_h_2], [empty_val_2], [an_coal], [wst_bqt_h_3], [harfer_cok], [wst_bqt_l], [wst_fbl])
+END
+GO
 
--- 3. Populate Sample Mock Data for May 15, 2026 (matching screenshot sample data)
-DELETE FROM batching_data WHERE batching_time >= '2026-05-15 00:00:00' AND batching_time < '2026-05-16 00:00:00';
+-- 3. Populate Sample Mock Data for May 15, 2026 (matching the screenshot data)
+DELETE FROM [dbo].[batching_data] WHERE [batching_time] >= '2026-05-15 00:00:00' AND [batching_time] < '2026-05-16 00:00:00';
+GO
 
-INSERT INTO batching_data 
-    (batch_no, batching_time, empty_val_1, wst_bqt_h_1, qtz, wst_bqt_h_2, empty_val_2, an_coal, wst_bqt_h_3, harfer_cok, wst_bqt_l, wst_fbl)
+INSERT INTO [dbo].[batching_data] 
+    ([batch_no], [batching_time], [empty_val_1], [wst_bqt_h_1], [qtz], [wst_bqt_h_2], [empty_val_2], [an_coal], [wst_bqt_h_3], [harfer_cok], [wst_bqt_l], [wst_fbl])
 VALUES
     (1, '2026-05-15 06:09:46', 0.00, 705.20, 277.94, 0.00, 0.00, 0.00, 1412.76, 293.35, 658.50, 259.63),
     (2, '2026-05-15 06:18:11', 0.00, 697.49, 251.93, 0.00, 0.00, 0.00, 1398.03, 289.85, 649.20, 250.17),
@@ -67,6 +75,7 @@ VALUES
     (33, '2026-05-15 10:56:16', 0.00, 703.06, 253.68, 0.00, 0.00, 0.00, 1401.69, 289.85, 647.44, 248.42),
     (34, '2026-05-15 11:17:15', 0.00, 699.47, 247.88, 0.00, 0.00, 0.00, 1395.90, 289.85, 652.93, 253.91),
     (35, '2026-05-15 11:26:46', 0.00, 701.00, 246.28, 0.00, 0.00, 0.00, 1403.45, 289.62, 649.20, 250.17);
+GO
 
--- 4. Verification output
-SELECT 'Mock data loaded successfully. Total records: ' || count(*) AS status FROM batching_data;
+PRINT 'Mock data loaded successfully.';
+GO
