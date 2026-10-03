@@ -21,25 +21,53 @@ class DatabaseClient:
             self.sqlite_path = sqlite_raw
         self.use_sqlite = False
         
-    def _get_connection_string(self):
+    def _build_conn_str(self, server):
         driver = self.db_config.get("driver", "ODBC Driver 17 for SQL Server")
-        server = self.db_config.get("server", "localhost")
         database = self.db_config.get("database", "PlantDB")
         trusted = self.db_config.get("trusted_connection", False)
         username = self.db_config.get("username", "")
         password = self.db_config.get("password", "")
         
+        # Ensure TrustServerCertificate=yes is included to avoid SSL/TLS certificate errors
+        extra_flags = "TrustServerCertificate=yes;"
+        
         if trusted:
-            return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};Trusted_Connection=yes;"
+            return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};Trusted_Connection=yes;{extra_flags}"
         else:
-            return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={username};PWD={password};"
+            return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={username};PWD={password};{extra_flags}"
+
+    def _get_connection_string(self):
+        server = self.db_config.get("server", "localhost")
+        return self._build_conn_str(server)
 
     def _connect_sql_server(self):
         import pyodbc
-        conn_str = self._get_connection_string()
-        logger.info(f"Connecting to SQL Server: SERVER={self.db_config.get('server')}, DATABASE={self.db_config.get('database')}")
-        # Add timeout to connection
-        return pyodbc.connect(conn_str, timeout=5)
+        primary_server = self.db_config.get("server", "localhost")
+        logger.info(f"Connecting to SQL Server: SERVER={primary_server}, DATABASE={self.db_config.get('database')}")
+        
+        # List of server name variations to try if primary fails with 08001 (instance not found)
+        candidates = [primary_server]
+        if "\\" in primary_server:
+            # If "LOCALHOST\SQLEXPRESS", also try ".\SQLEXPRESS" and "(local)\SQLEXPRESS"
+            inst_name = primary_server.split("\\", 1)[1]
+            candidates.extend([f".\\{inst_name}", f"(local)\\{inst_name}", f"127.0.0.1\\{inst_name}"])
+        elif primary_server.lower() in ["localhost", "127.0.0.1", ".", "(local)"]:
+            candidates.extend([".", "(local)", "localhost", "127.0.0.1"])
+
+        last_error = None
+        for candidate in dict.fromkeys(candidates):
+            conn_str = self._build_conn_str(candidate)
+            try:
+                logger.debug(f"Attempting SQL Server connection with SERVER={candidate}...")
+                conn = pyodbc.connect(conn_str, timeout=3)
+                if candidate != primary_server:
+                    logger.info(f"Successfully connected to SQL Server using alternate server name: '{candidate}'")
+                return conn
+            except Exception as e:
+                last_error = e
+                logger.debug(f"Failed connecting to SQL Server with SERVER={candidate}: {e}")
+
+        raise last_error
 
     def _connect_sqlite(self):
         logger.info(f"Connecting to SQLite database: {self.sqlite_path}")
@@ -47,7 +75,29 @@ class DatabaseClient:
         sqlite_dir = os.path.dirname(os.path.abspath(self.sqlite_path))
         if sqlite_dir and not os.path.exists(sqlite_dir):
             os.makedirs(sqlite_dir, exist_ok=True)
-        return sqlite3.connect(self.sqlite_path)
+            
+        conn = sqlite3.connect(self.sqlite_path)
+        # Ensure table exists
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS batching_data (
+            batch_no INTEGER NOT NULL,
+            batching_time TEXT NOT NULL,
+            empty_val_1 REAL DEFAULT 0.00,
+            wst_bqt_h_1 REAL DEFAULT 0.00,
+            qtz REAL DEFAULT 0.00,
+            wst_bqt_h_2 REAL DEFAULT 0.00,
+            empty_val_2 REAL DEFAULT 0.00,
+            an_coal REAL DEFAULT 0.00,
+            wst_bqt_h_3 REAL DEFAULT 0.00,
+            harfer_cok REAL DEFAULT 0.00,
+            wst_bqt_l REAL DEFAULT 0.00,
+            wst_fbl REAL DEFAULT 0.00
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS IX_batching_data_batching_time ON batching_data (batching_time ASC);")
+        conn.commit()
+        return conn
 
     def get_connection(self):
         """
