@@ -19,7 +19,9 @@ class DatabaseClient:
             self.sqlite_path = os.path.join(base_dir, sqlite_raw)
         else:
             self.sqlite_path = sqlite_raw
-        self.use_sqlite = False
+        engine = str(self.db_config.get("engine", "")).strip().lower()
+        driver = str(self.db_config.get("driver", "")).strip().lower()
+        self.use_sqlite = (engine == "sqlite" or "sqlite" in driver)
         
     def _build_conn_str(self, server):
         driver = self.db_config.get("driver", "ODBC Driver 17 for SQL Server")

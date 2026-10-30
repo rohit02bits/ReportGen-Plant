@@ -90,6 +90,7 @@ Examples:
     parser.add_argument("--init-db", action="store_true", help="Initialize database schema, tables, and indexes")
     parser.add_argument("--mock-data", action="store_true", help="Generate and insert mock plant batch data into the connected database")
     parser.add_argument("--mock-days", type=int, default=7, help="Number of past days for mock data generation (default: 7)")
+    parser.add_argument("--sqlite", action="store_true", help="Force local SQLite database mode (mock_plant.db)")
     parser.add_argument("--db-stats", action="store_true", help="Display record count and statistics for the connected database")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Set the logging detail level (default: INFO)")
 
@@ -111,6 +112,11 @@ Examples:
         
     logger.info(f"Loading configuration from: {config_path}")
     config = load_config(config_path)
+
+    if args.sqlite:
+        config.setdefault("database", {})["engine"] = "sqlite"
+        config["database"]["fallback_to_sqlite"] = True
+        logger.info("Forcing local SQLite database mode via CLI flag.")
     
     # Parse target date if provided
     target_date = date.today()
