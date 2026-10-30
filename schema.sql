@@ -27,6 +27,8 @@ CREATE INDEX IF NOT EXISTS IX_batching_data_batching_time
 ON batching_data (batching_time ASC);
 
 -- 3. Populate Sample Mock Data for May 15, 2026 (matching screenshot sample data)
+BEGIN TRANSACTION;
+
 DELETE FROM batching_data WHERE batching_time >= '2026-05-15 00:00:00' AND batching_time < '2026-05-16 00:00:00';
 
 INSERT INTO batching_data 
@@ -67,6 +69,8 @@ VALUES
     (33, '2026-05-15 10:56:16', 0.00, 703.06, 253.68, 0.00, 0.00, 0.00, 1401.69, 289.85, 647.44, 248.42),
     (34, '2026-05-15 11:17:15', 0.00, 699.47, 247.88, 0.00, 0.00, 0.00, 1395.90, 289.85, 652.93, 253.91),
     (35, '2026-05-15 11:26:46', 0.00, 701.00, 246.28, 0.00, 0.00, 0.00, 1403.45, 289.62, 649.20, 250.17);
+
+COMMIT;
 
 -- 4. Verification output
 SELECT 'Mock data loaded successfully. Total records: ' || count(*) AS status FROM batching_data;
