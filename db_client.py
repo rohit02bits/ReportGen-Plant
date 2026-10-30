@@ -23,15 +23,35 @@ class DatabaseClient:
         driver = str(self.db_config.get("driver", "")).strip().lower()
         self.use_sqlite = (engine == "sqlite" or "sqlite" in driver)
         
+    def _detect_odbc_driver(self):
+        """Auto-detects available SQL Server ODBC driver if preferred driver is not installed."""
+        preferred = self.db_config.get("driver", "ODBC Driver 17 for SQL Server")
+        try:
+            import pyodbc
+            available = pyodbc.drivers()
+            if preferred in available:
+                return preferred
+            for alt in ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server", "ODBC Driver 13 for SQL Server", "SQL Server Native Client 11.0", "SQL Server"]:
+                if alt in available:
+                    logger.info(f"Preferred ODBC driver '{preferred}' not found. Auto-detected available driver: '{alt}'")
+                    return alt
+        except Exception:
+            pass
+        return preferred
+
     def _build_conn_str(self, server):
-        driver = self.db_config.get("driver", "ODBC Driver 17 for SQL Server")
+        raw_conn_str = self.db_config.get("connection_string")
+        if raw_conn_str:
+            return raw_conn_str
+            
+        driver = self._detect_odbc_driver()
         database = self.db_config.get("database", "PlantDB")
         trusted = self.db_config.get("trusted_connection", False)
         username = self.db_config.get("username", "")
         password = self.db_config.get("password", "")
         
-        # Ensure TrustServerCertificate=yes is included to avoid SSL/TLS certificate errors
-        extra_flags = "TrustServerCertificate=yes;"
+        # Include TrustServerCertificate=yes and Encrypt=no to work seamlessly with both Driver 17 and Driver 18
+        extra_flags = "TrustServerCertificate=yes;Encrypt=no;Connection Timeout=4;"
         
         if trusted:
             return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};Trusted_Connection=yes;{extra_flags}"
@@ -44,24 +64,38 @@ class DatabaseClient:
 
     def _connect_sql_server(self):
         import pyodbc
+        
+        raw_conn_str = self.db_config.get("connection_string")
+        if raw_conn_str:
+            logger.info("Connecting to SQL Server using explicit connection_string from config.")
+            return pyodbc.connect(raw_conn_str, timeout=4)
+
         primary_server = self.db_config.get("server", "localhost")
         logger.info(f"Connecting to SQL Server: SERVER={primary_server}, DATABASE={self.db_config.get('database')}")
         
         # List of server name variations to try if primary fails with 08001 (instance not found)
         candidates = [primary_server]
         if "\\" in primary_server:
-            # If "LOCALHOST\SQLEXPRESS", also try ".\SQLEXPRESS" and "(local)\SQLEXPRESS"
             inst_name = primary_server.split("\\", 1)[1]
-            candidates.extend([f".\\{inst_name}", f"(local)\\{inst_name}", f"127.0.0.1\\{inst_name}"])
+            candidates.extend([
+                f".\\{inst_name}",
+                f"(local)\\{inst_name}",
+                f"127.0.0.1\\{inst_name}",
+                f"np:\\\\.\\pipe\\MSSQL${inst_name}\\sql\\query",
+                f"np:{primary_server}",
+                ".",
+                "localhost",
+                "(local)"
+            ])
         elif primary_server.lower() in ["localhost", "127.0.0.1", ".", "(local)"]:
-            candidates.extend([".", "(local)", "localhost", "127.0.0.1"])
+            candidates.extend([".", "(local)", "localhost", "127.0.0.1", "np:\\\\.\\pipe\\sql\\query"])
 
         last_error = None
         for candidate in dict.fromkeys(candidates):
             conn_str = self._build_conn_str(candidate)
             try:
                 logger.debug(f"Attempting SQL Server connection with SERVER={candidate}...")
-                conn = pyodbc.connect(conn_str, timeout=3)
+                conn = pyodbc.connect(conn_str, timeout=4)
                 if candidate != primary_server:
                     logger.info(f"Successfully connected to SQL Server using alternate server name: '{candidate}'")
                 return conn
@@ -69,6 +103,12 @@ class DatabaseClient:
                 last_error = e
                 logger.debug(f"Failed connecting to SQL Server with SERVER={candidate}: {e}")
 
+        logger.error(
+            f"Failed to connect to SQL Server after trying server variations: {candidates}. "
+            "Please verify: 1) SQL Server (SQLEXPRESS) service is running ('net start MSSQL$SQLEXPRESS'), "
+            "2) SQL Server Browser service is running ('net start SQLBrowser'), "
+            "3) TCP/IP and Named Pipes are enabled in SQL Server Configuration Manager."
+        )
         raise last_error
 
     def _connect_sqlite(self):
@@ -101,6 +141,41 @@ class DatabaseClient:
         conn.commit()
         return conn
 
+    def _format_db_error(self, e):
+        """Converts raw database exceptions into crisp, actionable error messages."""
+        err_str = str(e)
+        server = self.db_config.get("server", "localhost")
+        database = self.db_config.get("database", "PlantDB")
+        driver = self.db_config.get("driver", "ODBC Driver 17 for SQL Server")
+
+        if "08001" in err_str or "Error Locating Server/Instance" in err_str:
+            return (
+                f"Instance '{server}' is unreachable [ODBC 08001]. "
+                "Ensure SQL Server service ('net start MSSQL$SQLEXPRESS') and SQL Server Browser service ('net start SQLBrowser') are running."
+            )
+        elif "4060" in err_str or "Cannot open database" in err_str:
+            return (
+                f"Database '{database}' does not exist on '{server}' [ODBC 4060]. "
+                "Run schema_sqlserver.sql in SSMS or 'python mock_db_setup.py --sqlserver --init-only' to create it."
+            )
+        elif "18456" in err_str or "28000" in err_str or "Login failed" in err_str:
+            user = self.db_config.get("username") or "Windows User"
+            return (
+                f"Authentication failed for user '{user}' [ODBC 18456]. "
+                "Check password or set trusted_connection: true for Windows Authentication."
+            )
+        elif "IM002" in err_str or ("driver" in err_str.lower() and "not found" in err_str.lower()):
+            return (
+                f"ODBC driver '{driver}' not found [ODBC IM002]. "
+                "Please install Microsoft ODBC Driver 17 or 18 for SQL Server."
+            )
+        elif "No module named 'pyodbc'" in err_str:
+            return "Missing 'pyodbc' package. Install with 'pip install pyodbc' or set engine: 'sqlite' in config.yaml."
+
+        if isinstance(e, tuple) and len(e) >= 2:
+            return f"{e[0]}: {str(e[1]).split('] ')[-1]}"
+        return err_str
+
     def get_connection(self):
         """
         Returns an active database connection (SQL Server or SQLite).
@@ -111,10 +186,12 @@ class DatabaseClient:
         try:
             return self._connect_sql_server()
         except Exception as e:
+            crisp_error = self._format_db_error(e)
             if self.fallback:
-                logger.warning(f"SQL Server connection failed: {e}. Falling back to SQLite.")
+                logger.warning(f"SQL Server connection failed: {crisp_error} Falling back to SQLite.")
                 self.use_sqlite = True
                 return self._connect_sqlite()
+            logger.error(f"SQL Server connection failed: {crisp_error}")
             raise e
 
     def init_schema(self):

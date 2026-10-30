@@ -63,6 +63,11 @@ class Scheduler:
         try:
             # Query data
             df = self.db_client.get_batching_data(start_dt, end_dt)
+            if df.empty:
+                logger.warning(
+                    f"No records found for '{shift_def['name']}' between {start_dt} and {end_dt}. "
+                    "If testing locally, populate data with 'python mock_db_setup.py --sqlite' or query benchmark date with '--date 2026-05-15'."
+                )
             
             # Generate excel
             filepath = self.report_gen.generate_excel_report(shift_def["name"], start_dt, end_dt, df)
