@@ -120,9 +120,10 @@ class Scheduler:
         logger.info(f"Closest scheduled run in the past was '{best_shift['name']}' at {best_run_dt} (diff: {best_diff})")
         return best_shift, best_run_date
 
-    def start_service_mode(self, dry_run: bool = False):
+    def start_service_mode(self, dry_run: bool = False, stop_event=None):
         """
         Starts the continuous service loop scheduling tasks at the defined run times.
+        If stop_event (threading.Event) is provided, the loop exits once it is set.
         """
         logger.info("Starting background scheduler service mode...")
         
@@ -154,9 +155,12 @@ class Scheduler:
                 return
 
             logger.info("Scheduler service is running. Press Ctrl+C to exit.")
-            while True:
+            while stop_event is None or not stop_event.is_set():
                 schedule.run_pending()
-                time.sleep(1)
+                if stop_event is not None:
+                    stop_event.wait(1)
+                else:
+                    time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Scheduler service stopped by user (KeyboardInterrupt).")
         except Exception as e:

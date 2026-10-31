@@ -146,8 +146,29 @@ This is the most reliable production setup as it survives system restarts, has b
    - **Shift A Report:** Runs Daily at `2:05 PM` (14:05)
    - **Shift B Report:** Runs Daily at `10:05 PM` (22:05)
 
-### Option B: Running as a Continuous Background Daemon
-Alternatively, you can run the scheduler continuously in a command window or as a custom Windows Service using a process manager:
+### Option B: Running as a Windows Service (Auto-start & Auto-restart)
+The scheduler can be installed as a native Windows Service named `PlantReportGenerator`. It starts automatically at boot (Automatic - Delayed Start) and Windows restarts it 60 seconds after any crash.
+
+1. Copy the deployment folder (containing `ReportGeneratorService.exe`, `config.yaml` and `install_service.bat`) to its final location, e.g. `C:\PlantApplications\ReportGenerator`.
+2. Right-click `install_service.bat` and choose **Run as administrator**.
+
+Manage it from `services.msc` or the command line:
+
+```cmd
+sc query PlantReportGenerator
+sc stop PlantReportGenerator
+sc start PlantReportGenerator
+```
+
+To remove it, run `uninstall_service.bat` as administrator.
+
+**Notes:**
+- Logs are written to `logs\reporter.log` next to the executable; service start/stop events also appear in the Windows Event Viewer (Application log).
+- The service runs as `LocalSystem` by default. If SQL Server uses Windows Authentication (`trusted_connection: true`), set the service's **Log On** account in `services.msc` to a user that has database access.
+- Without the compiled executable, `install_service.bat` falls back to `python windows_service.py`. This needs `pywin32` installed for the system-wide Python and `python -m pywin32_postinstall -install` run once as administrator.
+
+### Option C: Running as a Continuous Background Daemon
+Alternatively, you can run the scheduler continuously in a command window:
 
 ```cmd
 python main.py --service
