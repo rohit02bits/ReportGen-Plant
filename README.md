@@ -146,8 +146,61 @@ This is the most reliable production setup as it survives system restarts, has b
    - **Shift A Report:** Runs Daily at `2:05 PM` (14:05)
    - **Shift B Report:** Runs Daily at `10:05 PM` (22:05)
 
-### Option B: Running as a Continuous Background Daemon
-Alternatively, you can run the scheduler continuously in a command window or as a custom Windows Service using a process manager:
+### Option B: Running as a Windows Service (Auto-start & Auto-restart)
+The scheduler can be installed as a native Windows Service named `PlantReportGenerator`. It starts automatically at boot (Automatic - Delayed Start) and Windows restarts it 60 seconds after any crash.
+
+#### 1. Get the service executable
+Either download the **ReportGenerator-Windows-Deployment** artifact from the latest *Build Windows Executable* run in GitHub Actions, or build it locally:
+
+```cmd
+pip install -r requirements.txt
+python package.py
+```
+This creates `dist\ReportGenerator.exe` and `dist\ReportGeneratorService.exe`.
+
+#### 2. Install
+1. Copy `ReportGeneratorService.exe`, `config.yaml`, `install_service.bat` and `uninstall_service.bat` into one folder at its final location, e.g. `C:\PlantApplications\ReportGenerator`.
+2. Right-click `install_service.bat` and choose **Run as administrator**.
+
+#### 3. Verify
+- **Optional, before installing:** run the service in the console to check config and schedules (Ctrl+C to stop):
+  ```cmd
+  ReportGeneratorService.exe debug
+  ```
+  You should see `Scheduling 'Shift A' to run daily at 14:05` (and the other shifts) followed by `Scheduler service is running`.
+- **Service status and settings** (from an Administrator PowerShell):
+  ```powershell
+  sc.exe query PlantReportGenerator      # STATE should be RUNNING
+  sc.exe qc PlantReportGenerator         # START_TYPE should be AUTO_START (DELAYED)
+  sc.exe qfailure PlantReportGenerator   # FAILURE_ACTIONS should be RESTART -- Delay = 60000 ms
+  ```
+- **Auto-restart after a crash:** note the PID, kill the process, wait 70 seconds and check that it is `RUNNING` again with a new PID:
+  ```powershell
+  sc.exe queryex PlantReportGenerator
+  Stop-Process -Name ReportGeneratorService -Force
+  Start-Sleep 70
+  sc.exe queryex PlantReportGenerator
+  ```
+  `logs\reporter.log` will show a new `Service starting from: ...` line for the restart.
+
+#### 4. Manage
+Use `services.msc` or the command line:
+
+```cmd
+sc query PlantReportGenerator
+sc stop PlantReportGenerator
+sc start PlantReportGenerator
+```
+
+To remove it, run `uninstall_service.bat` as administrator.
+
+**Notes:**
+- Logs are written to `logs\reporter.log` next to the executable; service start/stop events also appear in the Windows Event Viewer (Application log).
+- The service runs as `LocalSystem` by default. If SQL Server uses Windows Authentication (`trusted_connection: true`), set the service's **Log On** account in `services.msc` to a user that has database access.
+- Without the compiled executable, `install_service.bat` falls back to `python windows_service.py`. This needs `pywin32` installed for the system-wide Python and `python -m pywin32_postinstall -install` run once as administrator.
+
+### Option C: Running as a Continuous Background Daemon
+Alternatively, you can run the scheduler continuously in a command window:
 
 ```cmd
 python main.py --service

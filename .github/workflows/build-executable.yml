@@ -35,6 +35,9 @@ jobs:
       run: |
         mkdir deploy
         copy dist\ReportGenerator.exe deploy\
+        copy dist\ReportGeneratorService.exe deploy\
+        copy install_service.bat deploy\
+        copy uninstall_service.bat deploy\
         copy config.yaml deploy\
         copy run_reporter.bat deploy\
         copy schema.sql deploy\
