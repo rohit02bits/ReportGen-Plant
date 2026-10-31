@@ -149,10 +149,42 @@ This is the most reliable production setup as it survives system restarts, has b
 ### Option B: Running as a Windows Service (Auto-start & Auto-restart)
 The scheduler can be installed as a native Windows Service named `PlantReportGenerator`. It starts automatically at boot (Automatic - Delayed Start) and Windows restarts it 60 seconds after any crash.
 
-1. Copy the deployment folder (containing `ReportGeneratorService.exe`, `config.yaml` and `install_service.bat`) to its final location, e.g. `C:\PlantApplications\ReportGenerator`.
+#### 1. Get the service executable
+Either download the **ReportGenerator-Windows-Deployment** artifact from the latest *Build Windows Executable* run in GitHub Actions, or build it locally:
+
+```cmd
+pip install -r requirements.txt
+python package.py
+```
+This creates `dist\ReportGenerator.exe` and `dist\ReportGeneratorService.exe`.
+
+#### 2. Install
+1. Copy `ReportGeneratorService.exe`, `config.yaml`, `install_service.bat` and `uninstall_service.bat` into one folder at its final location, e.g. `C:\PlantApplications\ReportGenerator`.
 2. Right-click `install_service.bat` and choose **Run as administrator**.
 
-Manage it from `services.msc` or the command line:
+#### 3. Verify
+- **Optional, before installing:** run the service in the console to check config and schedules (Ctrl+C to stop):
+  ```cmd
+  ReportGeneratorService.exe debug
+  ```
+  You should see `Scheduling 'Shift A' to run daily at 14:05` (and the other shifts) followed by `Scheduler service is running`.
+- **Service status and settings** (from an Administrator PowerShell):
+  ```powershell
+  sc.exe query PlantReportGenerator      # STATE should be RUNNING
+  sc.exe qc PlantReportGenerator         # START_TYPE should be AUTO_START (DELAYED)
+  sc.exe qfailure PlantReportGenerator   # FAILURE_ACTIONS should be RESTART -- Delay = 60000 ms
+  ```
+- **Auto-restart after a crash:** note the PID, kill the process, wait 70 seconds and check that it is `RUNNING` again with a new PID:
+  ```powershell
+  sc.exe queryex PlantReportGenerator
+  Stop-Process -Name ReportGeneratorService -Force
+  Start-Sleep 70
+  sc.exe queryex PlantReportGenerator
+  ```
+  `logs\reporter.log` will show a new `Service starting from: ...` line for the restart.
+
+#### 4. Manage
+Use `services.msc` or the command line:
 
 ```cmd
 sc query PlantReportGenerator
