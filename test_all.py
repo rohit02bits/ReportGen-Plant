@@ -197,5 +197,11 @@ class TestPlantBatchingSystem(unittest.TestCase):
         self.assertIn("ABB.DriveOPC", candidates)
         self.assertTrue(client._is_local_host())
 
+        # Verify automatic stripping of server ProgID prefix from tag names
+        prefixed_tag = "ABB.AC800MC_OpcDaServer.3.Applications.Application_1.AI1.Value"
+        tag_candidates = client._candidate_tag_names(prefixed_tag)
+        self.assertEqual(tag_candidates[0], prefixed_tag)
+        self.assertIn("Applications.Application_1.AI1.Value", tag_candidates)
+
 if __name__ == "__main__":
     unittest.main()

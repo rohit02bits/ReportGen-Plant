@@ -31,7 +31,7 @@ def _clean_str(val, default=""):
 class OPCClient:
     """
     Dual-protocol OPC Client supporting both:
-    1. Classic OPC DA (Windows COM/DCOM via OpenOPC, win32com, or 32-bit WOW64 COM Bridge, e.g. ABB.AC800MC_OpcDaServer.3 / ABB.DriveOPC)
+    1. Classic OPC DA (Windows COM/DCOM via OpenOPC, win32com AddItems/SyncRead, or 32-bit WOW64 COM Bridge, e.g. ABB.AC800MC_OpcDaServer.3)
     2. Modern OPC UA (Cross-platform via asyncua / opcua, tcp socket opc.tcp://...)
     3. Built-in Simulation Engine for offline testing and non-Windows environments.
     """
@@ -51,8 +51,37 @@ class OPCClient:
         "HSCOPC.Automation",
     ]
 
-    # Standard OPC Foundation OPCDAAuto.dll CLSID
+    # Standard OPC Foundation OPCDAAuto.dll GUIDs
     OPC_DA_AUTO_CLSID = "{28E68F9A-8D75-11D1-8DC3-3C302A000000}"
+    OPC_DA_AUTO_LIBID = "{28E68F91-8D75-11D1-8DC3-3C302A000000}"
+    PSOA_INTERFACE_CLSID = "{00020424-0000-0000-C000-000000000046}"
+
+    # InvokeTypes signatures for OPCDAAuto.dll OPCItems.AddItems and OPCGroup.SyncRead
+    # Avoids calling OPCItems.AddItem which returns COPCItem (missing COM_INTERFACE_ENTRY(IDispatch) in OPCDAAuto.dll, causing E_NOINTERFACE -2147467262)
+    # 3 = VT_I4, 2 = VT_I2, 8 = VT_BSTR, 12 = VT_VARIANT
+    # 24584 = VT_ARRAY | VT_BYREF | VT_BSTR
+    # 24579 = VT_ARRAY | VT_BYREF | VT_I4
+    # 24588 = VT_ARRAY | VT_BYREF | VT_VARIANT
+    # 16396 = VT_BYREF | VT_VARIANT
+    ADD_ITEMS_ARG_TYPES = (
+        (3, 1),       # [in] long NumItems
+        (24584, 1),   # [in] SAFEARRAY(BSTR)* ItemIDs
+        (24579, 1),   # [in] SAFEARRAY(long)* ClientHandles
+        (24579, 2),   # [out] SAFEARRAY(long)* ServerHandles
+        (24579, 2),   # [out] SAFEARRAY(long)* Errors
+        (12, 17),     # [in, optional] VARIANT RequestedDataTypes
+        (12, 17),     # [in, optional] VARIANT AccessPaths
+    )
+
+    SYNC_READ_ARG_TYPES = (
+        (2, 1),       # [in] short Source (1 = OPCCache, 2 = OPCDevice)
+        (3, 1),       # [in] long NumItems
+        (24579, 1),   # [in] SAFEARRAY(long)* ServerHandles
+        (24588, 2),   # [out] SAFEARRAY(VARIANT)* Values
+        (24579, 2),   # [out] SAFEARRAY(long)* Errors
+        (16396, 18),  # [out, optional] VARIANT* Qualities
+        (16396, 18),  # [out, optional] VARIANT* TimeStamps
+    )
 
     def __init__(self, config, force_simulation=False):
         self.config = config
@@ -76,11 +105,15 @@ class OPCClient:
         # Active driver references
         # 'opc_ua', 'opc_ua_sync', 'opc_da_openopc', 'opc_da_win32', 'opc_da_wow64', or 'simulation'
         self.active_protocol = None
+        self.connected_da_server = None
         self.ua_client = None
         self.da_client = None
         self.da_com_server = None
         self.da_com_group = None
         self.da_com_items = {}
+        self.da_com_server_handles = {}  # {config_tag: int(server_handle)}
+        self.da_com_resolved_tags = {}   # {config_tag: actual_opc_tag}
+        self.da_com_warned_tags = set()  # tags that already logged an unknown-item warning
         self.wow64_proc = None
         self.connected = False
 
@@ -137,6 +170,38 @@ class OPCClient:
                 continue
         return False
 
+    def _candidate_tag_names(self, tag):
+        """
+        Generates candidate OPC DA ItemIDs for a configured tag.
+        If the user prefixed the tag with the OPC Server ProgID (e.g.
+        'ABB.AC800MC_OpcDaServer.3.Applications.Application_1.AI1.Value'),
+        also tries stripping the server ProgID prefix ('Applications.Application_1.AI1.Value').
+        """
+        candidates = [tag]
+        prefixes = []
+        if self.connected_da_server:
+            prefixes.append(self.connected_da_server + ".")
+        if self.server_name and (self.server_name + ".") not in prefixes:
+            prefixes.append(self.server_name + ".")
+
+        for pfx in prefixes:
+            if tag.lower().startswith(pfx.lower()):
+                stripped = tag[len(pfx):]
+                if stripped and stripped not in candidates:
+                    candidates.append(stripped)
+        return candidates
+
+    def _format_opc_error(self, err):
+        """Formats OPC / COM error codes into clear descriptions."""
+        s = str(err)
+        if "-1073479673" in s or "0xc0040007" in s.lower():
+            return "OPC_E_UNKNOWNITEMID (-1073479673): Tag does not exist in the OPC Server address space"
+        if "-1073479672" in s or "0xc0040008" in s.lower():
+            return "OPC_E_INVALIDITEMID (-1073479672): Tag syntax is invalid"
+        if "-2147467262" in s or "0x80004002" in s.lower():
+            return "E_NOINTERFACE (-2147467262): COM interface marshaling error"
+        return s
+
     def _run_async(self, coro):
         """Runs an async coroutine synchronously, handling any active event loops."""
         try:
@@ -177,8 +242,6 @@ class OPCClient:
             logger.info("Connected to Simulated ABB OPC Server successfully.")
             return True
 
-        # Determine connection order:
-        # On Windows, if protocol is 'opc_da'/'da' or ('auto' with a DA server configured), try OPC DA first!
         try_da_first = (
             self._is_windows_platform()
             and self.protocol in ("opc_da", "da", "auto")
@@ -194,7 +257,6 @@ class OPCClient:
                 if self.protocol in ("opc_da", "da"):
                     return self._fallback_simulation(f"OPC DA connection failed: {e}")
 
-        # Try OPC UA if requested explicitly, or in 'auto' mode when an OPC UA library is actually installed
         if self.protocol in ("opc_ua", "ua") or (
             self.protocol == "auto" and str(self.endpoint_url).startswith("opc.tcp://") and self._has_opc_ua_library()
         ):
@@ -208,7 +270,6 @@ class OPCClient:
         elif self.protocol == "auto" and not self._is_windows_platform():
             logger.warning("Neither 'asyncua' nor 'opcua' is installed and OPC DA requires Windows.")
 
-        # If DA wasn't tried yet (e.g. non-standard config on Windows), try it now
         if not try_da_first and self.protocol in ("opc_da", "da", "auto") and self._is_windows_platform():
             try:
                 if self._connect_opc_da():
@@ -224,7 +285,6 @@ class OPCClient:
         """Attempts connection to an OPC UA server."""
         logger.info(f"Attempting connection to OPC UA Server: {self.endpoint_url}")
 
-        # Try modern asyncua first
         try:
             from asyncua import Client
             self.ua_client = Client(url=self.endpoint_url)
@@ -245,7 +305,6 @@ class OPCClient:
         except Exception as e:
             logger.warning(f"asyncua connection error: {e}")
 
-        # Try legacy opcua fallback
         try:
             import opcua
             self.ua_client = opcua.Client(self.endpoint_url)
@@ -273,6 +332,7 @@ class OPCClient:
         if "abb" in self.server_name.lower():
             abb_defaults = [
                 "ABB.AC800MC_OpcDaServer.3",
+                "ABB.AC800MOPCDAServer.4",
                 "ABB.AC800MC_OpcDaServer",
                 "ABB.AC800MC_OpcDaServer.2",
                 "ABB.AC800MC_OpcDaServer.1",
@@ -290,19 +350,20 @@ class OPCClient:
 
     def _ensure_com_dll_surrogate(self):
         """
-        Enables 32-bit COM DLL Surrogate in HKCU for OPCDAAuto.dll so 64-bit Python
-        can instantiate 32-bit OPCDAAuto.dll via Windows dllhost.exe without needing 32-bit Python.
-        Does not require Administrator privileges (writes to HKCU\\Software\\Classes).
+        Enables 32-bit COM DLL Surrogate and registers OPCDAAuto.dll TypeLib & Interface
+        Proxy/Stubs (PSOAInterface) in HKCU so 64-bit Python can communicate with 32-bit
+        OPCDAAuto.dll via dllhost.exe without E_NOINTERFACE errors.
         """
         if not self._is_windows_platform():
             return
         try:
             import winreg
             clsid = self.OPC_DA_AUTO_CLSID
-            # Check if 32-bit OPCDAAuto.dll exists on the system
+            libid = self.OPC_DA_AUTO_LIBID
+            psoa = self.PSOA_INTERFACE_CLSID
             syswow64_dll = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "SysWOW64", "OPCDAAuto.dll")
 
-            # Configure AppID DllSurrogate in HKCU\Software\Classes
+            # 1. Configure AppID DllSurrogate in HKCU\Software\Classes
             appid_path = rf"Software\Classes\AppID\{clsid}"
             with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, appid_path, 0, winreg.KEY_WRITE) as k:
                 winreg.SetValueEx(k, "DllSurrogate", 0, winreg.REG_SZ, "")
@@ -317,12 +378,34 @@ class OPCClient:
                     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, rf"{clsid_base}\InprocServer32", 0, winreg.KEY_WRITE) as k:
                         winreg.SetValueEx(k, "", 0, winreg.REG_SZ, syswow64_dll)
                         winreg.SetValueEx(k, "ThreadingModel", 0, winreg.REG_SZ, "Both")
+                    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, rf"{clsid_base}\TypeLib", 0, winreg.KEY_WRITE) as k:
+                        winreg.SetValueEx(k, "", 0, winreg.REG_SZ, libid)
 
             for progid in ("OPC.Automation", "OPC.Automation.1"):
                 with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, rf"Software\Classes\{progid}\CLSID", 0, winreg.KEY_WRITE) as k:
                     winreg.SetValueEx(k, "", 0, winreg.REG_SZ, clsid)
+
+            # 2. Register TypeLib and all OPCDAAuto.dll dual interfaces with PSOAInterface in 64-bit & 32-bit HKCU
+            if os.path.exists(syswow64_dll):
+                for arch in ("win32", "win64"):
+                    tlb_key = rf"Software\Classes\TypeLib\{libid}\1.0\0\{arch}"
+                    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, tlb_key, 0, winreg.KEY_WRITE) as k:
+                        winreg.SetValueEx(k, "", 0, winreg.REG_SZ, syswow64_dll)
+
+                # OPCDAAuto.dll interfaces span {28E68F92-8D75-11D1-8DC3-3C302A000000} .. {28E68FA0-8D75-11D1-8DC3-3C302A000000}
+                for low_byte in range(0x92, 0xA2):
+                    iid = f"{{28E68F{low_byte:02X}-8D75-11D1-8DC3-3C302A000000}}"
+                    for if_base in (
+                        rf"Software\Classes\Interface\{iid}",
+                        rf"Software\Classes\WOW6432Node\Interface\{iid}",
+                    ):
+                        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, rf"{if_base}\ProxyStubClsid32", 0, winreg.KEY_WRITE) as k:
+                            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, psoa)
+                        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, rf"{if_base}\TypeLib", 0, winreg.KEY_WRITE) as k:
+                            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, libid)
+                            winreg.SetValueEx(k, "Version", 0, winreg.REG_SZ, "1.0")
         except Exception as e:
-            logger.debug(f"Could not configure HKCU COM DllSurrogate for OPCDAAuto.dll: {e}")
+            logger.debug(f"Could not configure HKCU COM DllSurrogate/TypeLib for OPCDAAuto.dll: {e}")
 
     def _dispatch_opc_automation_wrapper(self):
         """
@@ -338,8 +421,9 @@ class OPCClient:
         except Exception:
             pass
 
+        self._ensure_com_dll_surrogate()
+
         errors = []
-        # 1. Try standard Dispatch across known wrapper ProgIDs + CLSID
         targets = list(self.DA_WRAPPER_PROGIDS) + [self.OPC_DA_AUTO_CLSID]
         for wrapper in targets:
             try:
@@ -348,8 +432,6 @@ class OPCClient:
             except Exception as ex:
                 errors.append(f"{wrapper}: {ex}")
 
-        # 2. If 64-bit Python hit Class Not Registered (0x80040154), enable HKCU DllSurrogate and retry with CLSCTX_LOCAL_SERVER
-        self._ensure_com_dll_surrogate()
         CLSCTX_ACTIVATE_32_BIT_SERVER = 0x40000
         clsctx_flags = [
             pythoncom.CLSCTX_ALL,
@@ -404,6 +486,7 @@ class OPCClient:
                     else:
                         client.connect(srv, self.host)
                     self.da_client = client
+                    self.connected_da_server = srv
                     self.active_protocol = "opc_da_openopc"
                     self.connected = True
                     logger.info(f"Successfully connected to OPC DA Server '{srv}' using OpenOPC.")
@@ -419,13 +502,11 @@ class OPCClient:
             com_srv, wrapper_used = self._dispatch_opc_automation_wrapper()
             logger.info(f"Loaded OPC DA Automation Wrapper: '{wrapper_used}'")
 
-            # Discover installed OPC DA servers via GetOPCServers() if supported
             try:
                 discovered = com_srv.GetOPCServers() if is_local else com_srv.GetOPCServers(self.host)
                 if discovered:
                     disc_list = [str(s) for s in discovered if s]
                     logger.info(f"Discovered registered OPC DA Servers on host: {disc_list}")
-                    # Add any discovered server matching configured server or ABB
                     for d_srv in disc_list:
                         if d_srv.lower() == self.server_name.lower() and d_srv not in candidates:
                             candidates.insert(0, d_srv)
@@ -435,9 +516,6 @@ class OPCClient:
                 logger.debug(f"GetOPCServers() discovery note: {disc_err}")
 
             for srv in candidates:
-                # Important: For local OPC DA servers (like ABB.AC800MC_OpcDaServer.3),
-                # calling Connect(srv) WITHOUT the second host argument uses local COM activation
-                # and avoids remote DCOM / OpcEnum failures on 'localhost'.
                 connect_calls = (
                     [(srv,), (srv, self.host), (srv, "127.0.0.1")]
                     if is_local
@@ -450,6 +528,10 @@ class OPCClient:
                         self.da_com_server = com_srv
                         self.da_com_group = None
                         self.da_com_items = {}
+                        self.da_com_server_handles = {}
+                        self.da_com_resolved_tags = {}
+                        self.da_com_warned_tags = set()
+                        self.connected_da_server = srv
                         self.active_protocol = "opc_da_win32"
                         self.connected = True
                         logger.info(
@@ -464,11 +546,10 @@ class OPCClient:
         except Exception as wrapper_err:
             diagnostic_errors.append(str(wrapper_err))
 
-        # 3. Try 32-bit WOW64 PowerShell COM Bridge (solves 64-bit Python vs 32-bit OPCDAAuto.dll / 32-bit ABB OPC Server)
+        # 3. Try 32-bit WOW64 PowerShell COM Bridge
         if self._connect_opc_da_wow64_bridge(candidates, is_local, diagnostic_errors):
             return True
 
-        # Log clear, actionable diagnostics so the exact COM error is visible at WARNING/ERROR level
         err_summary = " | ".join(diagnostic_errors[:5])
         logger.error(
             f"OPC DA connection failed for candidates {candidates}. "
@@ -481,146 +562,173 @@ class OPCClient:
 
     def _connect_opc_da_wow64_bridge(self, candidates, is_local, diagnostic_errors):
         """
-        Spawns a persistent 32-bit Windows PowerShell (SysWOW64) worker to bridge 64-bit Python
-        to 32-bit OPCDAAuto.dll and 32-bit ABB OPC DA servers seamlessly.
+        Spawns a persistent 32-bit Windows Script Host (SysWOW64\\cscript.exe VBScript) or
+        32-bit PowerShell worker to run 32-bit OPCDAAuto.dll in-process without cross-bitness
+        COM marshaling issues.
         """
         sys_root = os.environ.get("SystemRoot", r"C:\Windows")
-        ps32_path = os.path.join(sys_root, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe")
-        if not os.path.exists(ps32_path):
-            ps32_path = "powershell.exe"
+        cscript32_path = os.path.join(sys_root, "SysWOW64", "cscript.exe")
+        if not os.path.exists(cscript32_path):
+            cscript32_path = "cscript.exe"
 
-        ps_script = r"""
-$ErrorActionPreference = 'Stop'
-$wrappers = @('OPC.Automation', 'OPC.Automation.1', 'Graybox.OPC.DAWrapper', 'Graybox.OPC.DAWrapper.1', 'Matrikon.OPC.Automation', 'ABB.OPC.Automation', 'RSI.OPCAutomation', 'HSCOPC.Automation')
-$opc = $null
-$usedWrapper = $null
-$wrapErrors = @()
-foreach ($w in $wrappers) {
-    try {
-        $opc = New-Object -ComObject $w
-        $usedWrapper = $w
-        break
-    } catch {
-        $wrapErrors += "$w : $($_.Exception.Message)"
-    }
-}
-if ($null -eq $opc) {
-    $out = @{ status = 'error'; error = "32-bit COM could not load any OPC Automation Wrapper (OPCDAAuto.dll not registered in SysWOW64). Details: " + ($wrapErrors -join '; ') }
-    Write-Output ($out | ConvertTo-Json -Compress)
-    exit 1
-}
+        vbs_script = r'''
+Option Explicit
+On Error Resume Next
 
-$discovered = @()
-try {
-    $disc = $opc.GetOPCServers()
-    if ($null -ne $disc) {
-        foreach ($d in $disc) { if ($d) { $discovered += [string]$d } }
-    }
-} catch {}
+Function JsonEscape(s)
+    Dim res, q
+    q = Chr(34)
+    res = CStr(s)
+    res = Replace(res, "\", "\\")
+    res = Replace(res, q, "\" & q)
+    res = Replace(res, vbCr, "")
+    res = Replace(res, vbLf, " ")
+    JsonEscape = res
+End Function
 
-$candidatesJson = $env:OPC_CANDIDATES_JSON
-$candidates = $candidatesJson | ConvertFrom-Json
-foreach ($d in $discovered) {
-    if ($d -like '*ABB*' -and ($candidates -notcontains $d)) {
-        $candidates += $d
-    }
-}
+Dim fso, shell, env
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+Set env = shell.Environment("PROCESS")
 
-$hostName = $env:OPC_HOST
-$isLocal = ($env:OPC_IS_LOCAL -eq '1')
-$connectedServer = $null
-$connErrors = @()
+Dim wrappers, w, opc, usedWrapper
+wrappers = Array("OPC.Automation", "OPC.Automation.1", "Graybox.OPC.DAWrapper", "Graybox.OPC.DAWrapper.1", "Matrikon.OPC.Automation", "ABB.OPC.Automation", "RSI.OPCAutomation", "HSCOPC.Automation")
+Set opc = Nothing
+usedWrapper = ""
 
-foreach ($srv in $candidates) {
-    try {
-        if ($isLocal) {
-            try {
-                $opc.Connect($srv)
-                $connectedServer = $srv
-                break
-            } catch {
-                $opc.Connect($srv, $hostName)
-                $connectedServer = $srv
-                break
-            }
-        } else {
-            $opc.Connect($srv, $hostName)
-            $connectedServer = $srv
-            break
-        }
-    } catch {
-        $connErrors += "$srv : $($_.Exception.Message)"
-    }
-}
+For Each w In wrappers
+    Err.Clear
+    Set opc = CreateObject(w)
+    If Err.Number = 0 And Not (opc Is Nothing) Then
+        usedWrapper = w
+        Exit For
+    End If
+Next
 
-if ($null -eq $connectedServer) {
-    $out = @{
-        status = 'error'
-        error = "32-bit wrapper '$usedWrapper' loaded (Discovered servers: $($discovered -join ', ')), but Connect failed: " + ($connErrors -join '; ')
-    }
-    Write-Output ($out | ConvertTo-Json -Compress)
-    exit 1
-}
+If opc Is Nothing Then
+    WScript.StdOut.WriteLine "{""status"":""error"",""error"":""32-bit cscript could not load OPC.Automation wrapper""}"
+    WScript.Quit 1
+End If
 
-$group = $opc.OPCGroups.Add('ReportGenWow64Group')
-$group.IsActive = $true
-$itemsMap = @{}
-$handleSeq = 1
+Dim candidatesRaw, candidates, srv, hostName, isLocal, connectedServer, connErr
+candidatesRaw = env("OPC_CANDIDATES_CSV")
+candidates = Split(candidatesRaw, "|")
+hostName = env("OPC_HOST")
+isLocal = (env("OPC_IS_LOCAL") = "1")
+connectedServer = ""
+connErr = ""
 
-$initOut = @{
-    status = 'connected'
-    wrapper = $usedWrapper
-    server = $connectedServer
-    discovered = $discovered
-}
-Write-Output ($initOut | ConvertTo-Json -Compress)
+For Each srv In candidates
+    If Len(Trim(srv)) > 0 Then
+        Err.Clear
+        If isLocal Then
+            opc.Connect Trim(srv)
+            If Err.Number <> 0 Then
+                Err.Clear
+                opc.Connect Trim(srv), hostName
+            End If
+        Else
+            opc.Connect Trim(srv), hostName
+        End If
+        If Err.Number = 0 Then
+            connectedServer = Trim(srv)
+            Exit For
+        Else
+            connErr = connErr & srv & ": " & Err.Description & " (" & Err.Number & "); "
+        End If
+    End If
+Next
 
-while ($true) {
-    $line = [Console]::In.ReadLine()
-    if ($null -eq $line) { break }
-    $line = $line.Trim()
-    if ($line -eq '' -or $line -eq 'QUIT') { break }
-    try {
-        $req = $line | ConvertFrom-Json
-        if ($req.cmd -eq 'READ') {
-            $vals = @{}
-            $errs = @{}
-            foreach ($t in $req.tags) {
-                $tagStr = [string]$t
-                try {
-                    if (-not $itemsMap.ContainsKey($tagStr)) {
-                        $item = $group.OPCItems.AddItem($tagStr, $handleSeq)
-                        $handleSeq += 1
-                        $itemsMap[$tagStr] = $item
-                    }
-                    $it = $itemsMap[$tagStr]
-                    try { $it.Read(2) | Out-Null } catch {}
-                    $vals[$tagStr] = $it.Value
-                } catch {
-                    $vals[$tagStr] = $null
-                    $errs[$tagStr] = $_.Exception.Message
-                }
-            }
-            $resp = @{ status = 'ok'; values = $vals; errors = $errs }
-            Write-Output ($resp | ConvertTo-Json -Compress)
-        }
-    } catch {
-        $resp = @{ status = 'error'; error = $_.Exception.Message }
-        Write-Output ($resp | ConvertTo-Json -Compress)
-    }
-}
-try { $opc.Disconnect() } catch {}
-"""
+If connectedServer = "" Then
+    WScript.StdOut.WriteLine "{""status"":""error"",""error"":""" & JsonEscape(connErr) & """}"
+    WScript.Quit 1
+End If
+
+Dim grp, opcItems, itemsDict, handleSeq
+Err.Clear
+Set grp = opc.OPCGroups.Add("ReportGenVbsGroup")
+grp.IsActive = True
+Set opcItems = grp.OPCItems
+Set itemsDict = CreateObject("Scripting.Dictionary")
+handleSeq = 1
+
+WScript.StdOut.WriteLine "{""status"":""connected"",""wrapper"":""" & JsonEscape(usedWrapper) & """,""server"":""" & JsonEscape(connectedServer) & """}"
+
+Dim line, tagsArr, t, cleanTag, stripPrefix, itemObj, valStr, errPairs, valPairs
+stripPrefix = LCase(connectedServer & ".")
+
+Do While Not WScript.StdIn.AtEndOfStream
+    line = Trim(WScript.StdIn.ReadLine())
+    If line = "QUIT" Or line = "" Then Exit Do
+    If Left(line, 5) = "READ:" Then
+        tagsArr = Split(Mid(line, 6), "|")
+        valPairs = ""
+        errPairs = ""
+        For Each t In tagsArr
+            If Len(t) > 0 Then
+                Err.Clear
+                If Not itemsDict.Exists(t) Then
+                    Set itemObj = Nothing
+                    Set itemObj = opcItems.AddItem(t, handleSeq)
+                    If Err.Number <> 0 And LCase(Left(t, Len(stripPrefix))) = stripPrefix Then
+                        Err.Clear
+                        cleanTag = Mid(t, Len(stripPrefix) + 1)
+                        Set itemObj = opcItems.AddItem(cleanTag, handleSeq)
+                    End If
+                    If Err.Number = 0 And Not (itemObj Is Nothing) Then
+                        handleSeq = handleSeq + 1
+                        Set itemsDict(t) = itemObj
+                    End If
+                End If
+
+                If itemsDict.Exists(t) Then
+                    Err.Clear
+                    Set itemObj = itemsDict(t)
+                    itemObj.Read 2
+                    Err.Clear
+                    Dim v
+                    v = itemObj.Value
+                    If Err.Number = 0 And Not IsNull(v) And Not IsEmpty(v) Then
+                        If IsNumeric(v) Then
+                            valStr = Replace(CStr(CDbl(v)), ",", ".")
+                        ElseIf VarType(v) = vbBoolean Then
+                            If v Then valStr = "1" Else valStr = "0"
+                        Else
+                            valStr = """" & JsonEscape(CStr(v)) & """"
+                        End If
+                    Else
+                        valStr = "null"
+                    End If
+                Else
+                    valStr = "null"
+                    errPairs = errPairs & """" & JsonEscape(t) & """:""" & JsonEscape(Err.Description & " (" & Err.Number & ")") & ""","
+                End If
+                valPairs = valPairs & """" & JsonEscape(t) & """:" & valStr & ","
+            End If
+        Next
+        If Right(valPairs, 1) = "," Then valPairs = Left(valPairs, Len(valPairs) - 1)
+        If Right(errPairs, 1) = "," Then errPairs = Left(errPairs, Len(errPairs) - 1)
+        WScript.StdOut.WriteLine "{""status"":""ok"",""values"":{" & valPairs & "},""errors"":{" & errPairs & "}}"
+    End If
+Loop
+
+opc.Disconnect
+'''
         try:
-            logger.info("Trying 32-bit WOW64 OPC DA COM bridge for 64-bit Python compatibility...")
+            logger.info("Starting 32-bit WOW64 in-process OPC DA bridge (SysWOW64\\cscript.exe)...")
+            import tempfile
+            vbs_file = os.path.join(tempfile.gettempdir(), f"opc_da_bridge_{os.getpid()}.vbs")
+            with open(vbs_file, "w", encoding="utf-8") as f:
+                f.write(vbs_script)
+
             env = os.environ.copy()
-            env["OPC_CANDIDATES_JSON"] = json.dumps(candidates)
+            env["OPC_CANDIDATES_CSV"] = "|".join(candidates)
             env["OPC_HOST"] = self.host
             env["OPC_IS_LOCAL"] = "1" if is_local else "0"
 
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.Popen(
-                [ps32_path, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+                [cscript32_path, "//NoLogo", vbs_file],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -633,18 +741,18 @@ try { $opc.Disconnect() } catch {}
             if not first_line:
                 stderr_out = proc.stderr.read().strip()
                 proc.terminate()
-                diagnostic_errors.append(f"WOW64Bridge: {stderr_out or 'No output from 32-bit PowerShell'}")
+                diagnostic_errors.append(f"WOW64Bridge: {stderr_out or 'No output from 32-bit cscript'}")
                 return False
 
             resp = json.loads(first_line.strip())
             if resp.get("status") == "connected":
                 self.wow64_proc = proc
+                self.connected_da_server = resp.get("server") or self.server_name
                 self.active_protocol = "opc_da_wow64"
                 self.connected = True
                 logger.info(
                     f"Successfully connected to OPC DA Server '{resp.get('server')}' "
-                    f"via 32-bit WOW64 COM Bridge (Wrapper: {resp.get('wrapper')}, "
-                    f"Discovered: {resp.get('discovered')})."
+                    f"via 32-bit WOW64 In-Process Bridge (Wrapper: {resp.get('wrapper')})."
                 )
                 return True
             else:
@@ -663,7 +771,6 @@ try { $opc.Disconnect() } catch {}
             self.active_protocol = None
             return
 
-        # Disconnect OPC UA
         if self.active_protocol == "opc_ua" and self.ua_client:
             try:
                 async def _do_disconnect():
@@ -684,7 +791,6 @@ try { $opc.Disconnect() } catch {}
             finally:
                 self.ua_client = None
 
-        # Disconnect OpenOPC
         if self.da_client:
             try:
                 self.da_client.close()
@@ -694,7 +800,6 @@ try { $opc.Disconnect() } catch {}
             finally:
                 self.da_client = None
 
-        # Disconnect win32com
         if self.da_com_server:
             try:
                 if self.da_com_group is not None:
@@ -710,8 +815,9 @@ try { $opc.Disconnect() } catch {}
                 self.da_com_server = None
                 self.da_com_group = None
                 self.da_com_items = {}
+                self.da_com_server_handles = {}
+                self.da_com_resolved_tags = {}
 
-        # Disconnect 32-bit WOW64 bridge
         if self.wow64_proc:
             try:
                 if self.wow64_proc.stdin:
@@ -746,21 +852,17 @@ try { $opc.Disconnect() } catch {}
                 result[t] = self.sim_tags_cache.get(t, 0.0)
             return result
 
-        # OPC UA Read
         if self.active_protocol == "opc_ua":
             return self._read_tags_opc_ua_async(tags)
         elif self.active_protocol == "opc_ua_sync":
             return self._read_tags_opc_ua_sync(tags)
 
-        # OPC DA Read via OpenOPC
         if self.active_protocol == "opc_da_openopc" and self.da_client:
             return self._read_tags_openopc(tags)
 
-        # OPC DA Read via win32com
         if self.active_protocol == "opc_da_win32" and self.da_com_server:
             return self._read_tags_win32com(tags)
 
-        # OPC DA Read via 32-bit WOW64 COM Bridge
         if self.active_protocol == "opc_da_wow64" and self.wow64_proc:
             return self._read_tags_wow64(tags)
 
@@ -812,6 +914,81 @@ try { $opc.Disconnect() } catch {}
             logger.error(f"OpenOPC read error: {e}")
             raise e
 
+    def _add_item_handle_win32com(self, opc_items, tag, client_handle):
+        """
+        Adds a tag to OPCItems using OPCItems.AddItems (via InvokeTypes) instead of AddItem.
+        Returns (server_handle, resolved_tag) or raises the underlying COM error.
+        Because AddItems returns SAFEARRAY(long) ServerHandles instead of a COPCItem pointer,
+        it completely avoids the OPCDAAuto.dll COPCItem E_NOINTERFACE (-2147467262) bug!
+        """
+        import pythoncom
+        dispid_add_items = opc_items._oleobj_.GetIDsOfNames("AddItems")
+        last_err = None
+
+        for candidate in self._candidate_tag_names(tag):
+            try:
+                res = opc_items._oleobj_.InvokeTypes(
+                    dispid_add_items,
+                    0,
+                    1,  # pythoncom.DISPATCH_METHOD
+                    (0, 0),
+                    self.ADD_ITEMS_ARG_TYPES,
+                    1,
+                    ["", candidate],
+                    [0, int(client_handle)],
+                    pythoncom.Missing,
+                    pythoncom.Missing,
+                )
+                if isinstance(res, tuple) and len(res) >= 2:
+                    srv_handles, errs = res[0], res[1]
+                    err_code = int(errs[-1]) if errs else -1
+                    srv_handle = int(srv_handles[-1]) if srv_handles else 0
+                    if err_code == 0 and srv_handle != 0:
+                        if candidate != tag:
+                            logger.info(f"Auto-resolved prefixed OPC DA tag '{tag}' -> '{candidate}'")
+                        return srv_handle, candidate
+                    last_err = f"OPC Error Code {err_code} ({self._format_opc_error(err_code)})"
+            except Exception as ex:
+                last_err = ex
+
+        raise RuntimeError(last_err or f"Could not add OPC DA tag '{tag}'")
+
+    def _sync_read_handles_win32com(self, opc_group, server_handles):
+        """
+        Calls OPCGroup.SyncRead via InvokeTypes for a list of integer server_handles.
+        Returns (values_list, errors_list). Never touches COPCItem interfaces.
+        """
+        dispid_sync_read = opc_group._oleobj_.GetIDsOfNames("SyncRead")
+        num_items = len(server_handles)
+        handles_arr = [0] + [int(h) for h in server_handles]
+
+        # Try OPCDevice (2) first, fallback to OPCCache (1)
+        last_err = None
+        for source in (2, 1):
+            try:
+                res = opc_group._oleobj_.InvokeTypes(
+                    dispid_sync_read,
+                    0,
+                    1,  # pythoncom.DISPATCH_METHOD
+                    (0, 0),
+                    self.SYNC_READ_ARG_TYPES,
+                    source,
+                    num_items,
+                    handles_arr,
+                )
+                if isinstance(res, tuple) and len(res) >= 2:
+                    raw_vals = list(res[0]) if res[0] is not None else []
+                    raw_errs = list(res[1]) if res[1] is not None else []
+                    # OPCDAAuto returns 1-based SAFEARRAY converted by pywin32 to a tuple of length num_items
+                    # (or num_items + 1 if 0-based). Slice the last num_items elements:
+                    vals = raw_vals[-num_items:] if len(raw_vals) >= num_items else raw_vals
+                    errs = raw_errs[-num_items:] if len(raw_errs) >= num_items else raw_errs
+                    return vals, errs
+            except Exception as ex:
+                last_err = ex
+
+        raise RuntimeError(f"OPCGroup.SyncRead failed: {last_err}")
+
     def _read_tags_win32com(self, tags):
         try:
             try:
@@ -829,41 +1006,82 @@ try { $opc.Disconnect() } catch {}
                 grp.IsActive = True
                 self.da_com_group = grp
                 self.da_com_items = {}
+                self.da_com_server_handles = {}
+                self.da_com_resolved_tags = {}
 
             opc_items = self.da_com_group.OPCItems
-            result = {}
+            result = {t: None for t in tags}
 
+            # 1. Register any new tags via OPCItems.AddItems (returns integer ServerHandles, no COPCItem)
             for idx, t in enumerate(tags):
+                if t in self.da_com_server_handles:
+                    continue
+                client_handle = len(self.da_com_server_handles) + idx + 1
                 try:
-                    if t not in self.da_com_items:
-                        client_handle = len(self.da_com_items) + idx + 1
-                        self.da_com_items[t] = opc_items.AddItem(t, client_handle)
-                    item = self.da_com_items[t]
-                    # Trigger synchronous device read (OPCDevice = 2); updates item.Value or returns tuple
-                    try:
-                        read_res = item.Read(2)
-                        if isinstance(read_res, tuple) and len(read_res) >= 1 and read_res[0] is not None:
-                            result[t] = read_res[0]
-                            continue
-                    except Exception:
-                        pass
-                    result[t] = item.Value
-                except Exception as item_err:
-                    logger.warning(f"win32com error reading OPC DA tag '{t}': {item_err}")
-                    result[t] = None
+                    srv_handle, resolved = self._add_item_handle_win32com(opc_items, t, client_handle)
+                    self.da_com_server_handles[t] = srv_handle
+                    self.da_com_resolved_tags[t] = resolved
+                except Exception as add_err:
+                    err_str = str(add_err)
+                    # If cross-bitness COM surrogate cannot marshal SAFEARRAYs (-2147467262), switch to 32-bit WOW64 in-process bridge
+                    if "-2147467262" in err_str or "0x80004002" in err_str.lower():
+                        logger.warning(
+                            "64-bit/32-bit COM surrogate hit E_NOINTERFACE (-2147467262). "
+                            "Switching to 32-bit WOW64 in-process OPC DA bridge..."
+                        )
+                        diag = []
+                        if self._connect_opc_da_wow64_bridge(
+                            [self.connected_da_server or self.server_name],
+                            self._is_local_host(),
+                            diag,
+                        ):
+                            return self._read_tags_wow64(tags)
+                    if t not in self.da_com_warned_tags:
+                        logger.warning(f"OPC DA tag '{t}' could not be added: {self._format_opc_error(add_err)}")
+                        self.da_com_warned_tags.add(t)
+
+            # 2. Perform bulk synchronous read via OPCGroup.SyncRead using integer ServerHandles
+            valid_tags = [t for t in tags if t in self.da_com_server_handles]
+            if not valid_tags:
+                return result
+
+            valid_handles = [self.da_com_server_handles[t] for t in valid_tags]
+            try:
+                vals, errs = self._sync_read_handles_win32com(self.da_com_group, valid_handles)
+                for idx, t in enumerate(valid_tags):
+                    err_code = int(errs[idx]) if idx < len(errs) else 0
+                    val = vals[idx] if idx < len(vals) else None
+                    if err_code == 0:
+                        result[t] = val
+                    else:
+                        logger.warning(f"SyncRead error for tag '{t}': {self._format_opc_error(err_code)}")
+                        result[t] = None
+            except Exception as sync_err:
+                err_str = str(sync_err)
+                if "-2147467262" in err_str or "0x80004002" in err_str.lower():
+                    logger.warning("SyncRead hit E_NOINTERFACE (-2147467262); switching to 32-bit WOW64 in-process bridge...")
+                    diag = []
+                    if self._connect_opc_da_wow64_bridge(
+                        [self.connected_da_server or self.server_name],
+                        self._is_local_host(),
+                        diag,
+                    ):
+                        return self._read_tags_wow64(tags)
+                raise sync_err
 
             return result
         except Exception as e:
             logger.error(f"win32com read error: {e}")
             self.da_com_group = None
             self.da_com_items = {}
+            self.da_com_server_handles = {}
             raise e
 
     def _read_tags_wow64(self, tags):
         if not self.wow64_proc or self.wow64_proc.poll() is not None:
             raise RuntimeError("32-bit WOW64 OPC DA bridge process is not running.")
-        req = json.dumps({"cmd": "READ", "tags": list(tags)})
-        self.wow64_proc.stdin.write(req + "\n")
+        req_line = "READ:" + "|".join(str(t) for t in tags)
+        self.wow64_proc.stdin.write(req_line + "\n")
         self.wow64_proc.stdin.flush()
         line = self.wow64_proc.stdout.readline()
         if not line:
@@ -873,7 +1091,9 @@ try { $opc.Disconnect() } catch {}
             raise RuntimeError(f"WOW64 OPC read failed: {resp.get('error')}")
         errs = resp.get("errors") or {}
         for t, err_msg in errs.items():
-            logger.warning(f"OPC DA tag '{t}' read warning: {err_msg}")
+            if t not in self.da_com_warned_tags:
+                logger.warning(f"OPC DA tag '{t}' read warning: {self._format_opc_error(err_msg)}")
+                self.da_com_warned_tags.add(t)
         return resp.get("values", {})
 
     # =========================================================================
@@ -916,7 +1136,6 @@ try { $opc.Disconnect() } catch {}
             trigger_tag: 0
         }
 
-        # Trigger tag simulation: for the last 3 seconds of a batch, set trigger to 1
         now = time.time()
         elapsed = now - getattr(self, 'sim_last_update', now)
         sim_interval = getattr(self, 'sim_interval', 15)

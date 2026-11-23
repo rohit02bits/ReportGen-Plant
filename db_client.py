@@ -339,9 +339,9 @@ class DatabaseClient:
                 placeholders.append("?")
                 val = data_dict[field]
                 if field == "batch_no":
-                    val = int(val)
-                elif field != "batching_time" and val is not None:
-                    val = float(val)
+                    val = int(float(val)) if val is not None else 1
+                elif field != "batching_time":
+                    val = float(val) if val is not None else 0.0
                 values.append(val)
         
         fields_str = ", ".join(fields)

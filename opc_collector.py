@@ -145,14 +145,36 @@ class OPCCollector:
     def _write_record(self, tag_values):
         """
         Maps OPC tag values to the database schema and writes to the DB client.
+        Auto-increments batch_no if the batch_no tag is unmapped or returns None.
         """
         data_dict = {}
+        non_null_count = 0
         # Map OPC tags back to DB fields
         for db_field, tag_name in self.tag_mappings.items():
-            data_dict[db_field] = tag_values.get(tag_name)
-            
+            val = tag_values.get(tag_name)
+            if val is not None:
+                non_null_count += 1
+            data_dict[db_field] = val
+
+        if non_null_count == 0:
+            logger.warning("All configured OPC tags returned None in this cycle; skipping database write.")
+            return
+
+        # Auto-assign sequential batch_no if batch_no tag is not mapped in PLC or returned None
+        raw_batch_no = data_dict.get("batch_no")
+        if raw_batch_no is None:
+            self.last_batch_no = (self.last_batch_no or 0) + 1
+            data_dict["batch_no"] = self.last_batch_no
+        else:
+            try:
+                data_dict["batch_no"] = int(float(raw_batch_no))
+                self.last_batch_no = data_dict["batch_no"]
+            except (ValueError, TypeError):
+                self.last_batch_no = (self.last_batch_no or 0) + 1
+                data_dict["batch_no"] = self.last_batch_no
+
         data_dict["batching_time"] = datetime.now()
-        
+
         logger.info(f"Writing new record to database. Batch No: {data_dict.get('batch_no')}")
         self.db_client.insert_batching_data(data_dict)
 
