@@ -1,7 +1,7 @@
 # Database Connection Configuration
 database:
   # Set engine to "sqlite" for local testing, or "sqlserver" for production SQL Server (defaults to auto/sqlserver)
-  # engine: "sqlite"
+  engine: "sqlite"
   driver: "ODBC Driver 17 for SQL Server"
   server: "LOCALHOST\\SQLEXPRESS"
   database: "PlantDB"
@@ -148,19 +148,19 @@ columns:
     format: "0.00"
     avg_summary: true
 
-# OPC Connection and Data Acquisition Settings (Supports both OPC UA and OPC DA for ABB Drive)
+# OPC Connection and Data Acquisition Settings (Supports both OPC UA and OPC DA for ABB Drive / AC800M)
 opc:
   enabled: true
-  # Protocol: "auto" (auto-detects), "opc_ua", or "opc_da"
-  protocol: "auto"
+  # Protocol: "opc_da" (Classic Windows COM), "opc_ua", or "auto" (prioritizes OPC DA on Windows)
+  protocol: "opc_da"
   
   # --- OPC UA Settings (Cross-platform, e.g. ABB AC500 / 800xA / FENA-21 Gateway) ---
   endpoint_url: "opc.tcp://localhost:4840"
   username: ""
   password: ""
 
-  # --- OPC DA Settings (Classic Windows COM, ABB DriveOPC Server software) ---
-  server: "ABB.DriveOPC"       # Candidates: ABB.DriveOPC, ABB.DriveDA
+  # --- OPC DA Settings (Classic Windows COM, ABB Control Builder M / DriveOPC Server) ---
+  server: "ABB.AC800MC_OpcDaServer.3"  # Candidates: ABB.AC800MC_OpcDaServer.3, ABB.DriveOPC, ABB.DriveDA
   host: "localhost"
   
   polling_interval_seconds: 10

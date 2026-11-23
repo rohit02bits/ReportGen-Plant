@@ -13,7 +13,15 @@ class DatabaseClient:
         self.config = config
         self.db_config = config.get("database", {})
         self.fallback = self.db_config.get("fallback_to_sqlite", True)
-        sqlite_raw = self.db_config.get("sqlite_db_path", "mock_plant.db")
+        sqlite_raw = str(self.db_config.get("sqlite_db_path", "mock_plant.db") or "mock_plant.db").strip()
+        # Repair unescaped Windows backslashes in double-quoted YAML strings (e.g. "\P" -> U+2029, "\L" -> U+2028, "\N" -> U+0085)
+        sqlite_raw = (
+            sqlite_raw.replace("\u2029", "\\P")
+            .replace("\u2028", "\\L")
+            .replace("\u0085", "\\N")
+        )
+        for ch in ("\ufeff", "\u200b", "\r", "\n", "\t"):
+            sqlite_raw = sqlite_raw.replace(ch, "")
         if not os.path.isabs(sqlite_raw):
             base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
             self.sqlite_path = os.path.join(base_dir, sqlite_raw)

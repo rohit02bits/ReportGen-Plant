@@ -174,5 +174,28 @@ class TestPlantBatchingSystem(unittest.TestCase):
         self.assertTrue(os.path.exists(filepath))
         self.assertTrue(filepath.endswith(".xlsx"))
 
+    def test_opc_da_candidates_and_yaml_path_repair(self):
+        cfg = {
+            "database": {
+                "engine": "sqlite",
+                "sqlite_db_path": "D:\\MyPythonProject\u2029lantDB"
+            },
+            "opc": {
+                "protocol": "opc_da",
+                "server": "ABB.AC800MC_OpcDaServer.3",
+                "host": "localhost",
+                "simulation": {"enabled": True}
+            }
+        }
+        db = DatabaseClient(cfg)
+        self.assertTrue(db.sqlite_path.endswith("D:\\MyPythonProject\\PlantDB"))
+
+        client = OPCClient(cfg)
+        candidates = client._build_da_candidates()
+        self.assertIn("ABB.AC800MC_OpcDaServer.3", candidates)
+        self.assertIn("ABB.AC800MC_OpcDaServer", candidates)
+        self.assertIn("ABB.DriveOPC", candidates)
+        self.assertTrue(client._is_local_host())
+
 if __name__ == "__main__":
     unittest.main()
