@@ -3,6 +3,7 @@ import time
 from datetime import datetime
 from db_client import DatabaseClient
 from opc_client import OPCClient
+from monitor_ui import get_status_tracker
 
 logger = logging.getLogger("ReportGenerator.OPCCollector")
 
@@ -14,15 +15,75 @@ class OPCCollector:
         
         self.opc_config = config.get("opc", {})
         self.poll_interval = self.opc_config.get("polling_interval_seconds", 2)
-        self.trigger_mode = self.opc_config.get("trigger_mode", "batch_no_change")
-        self.trigger_tag = self.opc_config.get("trigger_tag", "ABB_Drive.BatchComplete")
+        self.trigger_mode = self.opc_config.get("trigger_mode", "trigger_tag")
+        self.trigger_tag = self.opc_config.get("trigger_tag", "BatchCompleted")
+        self.trigger_tags = self._load_trigger_tags()
         
         self.tag_mappings = self.opc_config.get("tag_mappings", {})
         
         # Internal state
         self.last_batch_no = None
         self.last_trigger_val = None
+        self.last_trigger_vals = {}  # {tag_name: 0 or 1} for rising-edge (LOW -> HIGH) detection
+        self.poll_count = 0
+        self.tracker = get_status_tracker()
         self.running = False
+
+    def _load_trigger_tags(self):
+        """
+        Loads configurable BOOL trigger tags (e.g. BatchCompleted, BinLevelFull) from config.yaml.
+        Supports dict (e.g. {'batch_completed': 'BatchCompleted', 'bin_level_full': 'BinLevelFull'}),
+        list (e.g. ['BatchCompleted', 'BinLevelFull']), or single legacy trigger_tag string.
+        """
+        raw = self.opc_config.get("trigger_tags")
+        tags = []
+        if isinstance(raw, dict):
+            for _, tag_name in raw.items():
+                if tag_name and str(tag_name).strip():
+                    t = str(tag_name).strip()
+                    if t not in tags:
+                        tags.append(t)
+        elif isinstance(raw, list):
+            for tag_name in raw:
+                if tag_name and str(tag_name).strip():
+                    t = str(tag_name).strip()
+                    if t not in tags:
+                        tags.append(t)
+        elif isinstance(raw, str) and raw.strip():
+            tags.append(raw.strip())
+
+        if not tags:
+            single = self.opc_config.get("trigger_tag")
+            if single and str(single).strip():
+                tags.append(str(single).strip())
+            else:
+                tags = ["BatchCompleted", "BinLevelFull"]
+        return tags
+
+    @staticmethod
+    def _parse_bool_state(val):
+        """
+        Normalizes a PLC BOOL tag value into 0 (LOW/False) or 1 (HIGH/True).
+        Returns None if the tag value is None or unparseable.
+        Handles Python bool, int/float (including COM VARIANT_TRUE = -1), and strings.
+        """
+        if val is None:
+            return None
+        if isinstance(val, bool):
+            return 1 if val else 0
+        if isinstance(val, (int, float)):
+            return 1 if val != 0 else 0
+        if isinstance(val, str):
+            s = val.strip().lower()
+            if s in ("1", "true", "high", "on", "yes", "-1"):
+                return 1
+            if s in ("0", "false", "low", "off", "no", ""):
+                return 0
+            try:
+                return 1 if float(s) != 0 else 0
+            except ValueError:
+                return None
+        return None
 
     def _initialize_db_state(self):
         """
@@ -76,21 +137,47 @@ class OPCCollector:
         self._initialize_db_state()
 
         # Connect to OPC
+        self.tracker.update_opc(
+            state="CONNECTING",
+            collector_running=True,
+            server=self.opc_client.server_name,
+            host=self.opc_client.host,
+            trigger_mode=self.trigger_mode,
+            message=f"Connecting to OPC Server '{self.opc_client.server_name}'...",
+        )
         connected = False
         while self.running and not connected:
             try:
                 self.opc_client.connect()
                 connected = True
+                opc_state = "SIMULATION" if self.opc_client.simulation_mode else "CONNECTED"
+                self.tracker.update_opc(
+                    state=opc_state,
+                    collector_running=True,
+                    protocol=self.opc_client.active_protocol or self.opc_client.protocol,
+                    server=self.opc_client.connected_da_server or self.opc_client.server_name,
+                    host=self.opc_client.host,
+                    trigger_mode=self.trigger_mode,
+                    message=f"Connected via {self.opc_client.active_protocol} to '{self.opc_client.connected_da_server or self.opc_client.server_name}'",
+                )
             except Exception as e:
                 logger.error(f"Failed to connect to OPC Server: {e}. Retrying in 5 seconds...")
+                self.tracker.update_opc(
+                    state="ERROR",
+                    collector_running=True,
+                    message=f"Connection failed: {e}. Retrying in 5s...",
+                )
                 time.sleep(5)
 
         logger.info(f"OPC Data Collector started. Mode: {self.trigger_mode}, Poll Interval: {self.poll_interval}s")
         
         # Collect list of all unique tags to read
         tags_to_read = list(self.tag_mappings.values())
-        if self.trigger_mode == "trigger_tag" and self.trigger_tag not in tags_to_read:
-            tags_to_read.append(self.trigger_tag)
+        if self.trigger_mode in ("trigger_tag", "trigger_tags", "rising_edge"):
+            for t_tag in self.trigger_tags:
+                if t_tag not in tags_to_read:
+                    tags_to_read.append(t_tag)
+            logger.info(f"Monitoring PLC BOOL rising-edge trigger tags (LOW -> HIGH): {self.trigger_tags}")
 
         # Loop
         try:
@@ -100,11 +187,25 @@ class OPCCollector:
                 try:
                     # Read tags from OPC
                     tag_values = self.opc_client.read_tags(tags_to_read)
+                    self.poll_count += 1
+                    trig_snapshot = {
+                        t: (self._parse_bool_state(tag_values.get(t)) or 0)
+                        for t in self.trigger_tags
+                    }
+                    self.tracker.update_opc(
+                        state="SIMULATION" if self.opc_client.simulation_mode else "CONNECTED",
+                        collector_running=True,
+                        protocol=self.opc_client.active_protocol or self.opc_client.protocol,
+                        last_poll_time=datetime.now().strftime("%H:%M:%S"),
+                        poll_count=self.poll_count,
+                        trigger_tags=trig_snapshot,
+                        latest_values=tag_values,
+                    )
                     
                     # Process based on trigger mode
                     if self.trigger_mode == "batch_no_change":
                         self._process_batch_no_change(tag_values)
-                    elif self.trigger_mode == "trigger_tag":
+                    elif self.trigger_mode in ("trigger_tag", "trigger_tags", "rising_edge"):
                         self._process_trigger_tag(tag_values)
                     elif self.trigger_mode == "periodic":
                         self._process_periodic(tag_values)
@@ -173,10 +274,16 @@ class OPCCollector:
                 self.last_batch_no = (self.last_batch_no or 0) + 1
                 data_dict["batch_no"] = self.last_batch_no
 
-        data_dict["batching_time"] = datetime.now()
+        now_dt = datetime.now()
+        data_dict["batching_time"] = now_dt
 
         logger.info(f"Writing new record to database. Batch No: {data_dict.get('batch_no')}")
         self.db_client.insert_batching_data(data_dict)
+        self.tracker.record_db_capture(
+            batch_no=data_dict.get("batch_no"),
+            batch_time_str=now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            engine_label="SQLite" if self.db_client.use_sqlite else "SQL Server",
+        )
 
     def _process_batch_no_change(self, tag_values):
         """
@@ -216,27 +323,42 @@ class OPCCollector:
 
     def _process_trigger_tag(self, tag_values):
         """
-        Triggers database write on rising edge of trigger tag (0 -> 1).
+        Triggers database write whenever ANY configured BOOL trigger tag
+        (e.g. BatchCompleted or BinLevelFull) transitions from LOW (0/False) to HIGH (1/True).
         """
-        current_trigger = tag_values.get(self.trigger_tag)
-        if current_trigger is None:
-            return
+        active_triggers = self.trigger_tags if getattr(self, "trigger_tags", None) else [self.trigger_tag]
+        rising_edge_tags = []
 
-        try:
-            current_trigger = int(current_trigger)
-        except ValueError:
-            return
+        for t_tag in active_triggers:
+            if not t_tag:
+                continue
+            current_state = self._parse_bool_state(tag_values.get(t_tag))
+            if current_state is None:
+                continue
 
-        if self.last_trigger_val is None:
-            self.last_trigger_val = current_trigger
-            return
+            prev_state = self.last_trigger_vals.get(t_tag)
+            if prev_state is None:
+                # First observation: initialize baseline state
+                self.last_trigger_vals[t_tag] = current_state
+                self.last_trigger_val = current_state
+                logger.info(f"Initialized BOOL trigger tag '{t_tag}' state to {'HIGH (1)' if current_state == 1 else 'LOW (0)'}")
+                continue
 
-        # Detect transition from 0 to 1 (or False to True)
-        if self.last_trigger_val == 0 and current_trigger == 1:
-            logger.info(f"OPC Trigger event detected on tag '{self.trigger_tag}'")
+            # Detect rising edge transition: LOW (0) -> HIGH (1)
+            if prev_state == 0 and current_state == 1:
+                rising_edge_tags.append(t_tag)
+
+            self.last_trigger_vals[t_tag] = current_state
+            self.last_trigger_val = current_state
+
+        if rising_edge_tags:
+            logger.info(f"Rising-edge trigger (LOW -> HIGH) detected on PLC BOOL tag(s): {rising_edge_tags}")
+            self.tracker.update_opc(
+                last_triggered_by=", ".join(rising_edge_tags),
+                last_trigger_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                message=f"Rising-edge trigger (LOW -> HIGH) on {', '.join(rising_edge_tags)}",
+            )
             self._write_record(tag_values)
-            
-        self.last_trigger_val = current_trigger
 
     def _process_periodic(self, tag_values):
         """

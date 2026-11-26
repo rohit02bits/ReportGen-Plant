@@ -11,6 +11,8 @@ This Python application generates daily, shift-wise reports from an SQL Server d
 - **Dual Running Modes:**
   1. **Continuous Daemon Mode:** Runs in the background and uses Python's internal timer scheduler.
   2. **Windows Task Scheduler Mode (Recommended):** The CLI can be called by Task Scheduler using `--run-current` to run whichever shift report is due at that exact moment.
+- **OPC DA / OPC UA Live Data Acquisition:** Connects to ABB OPC DA servers (e.g., `ABB.AC800MC_OpcDaServer.3`, `ABB.DriveOPC`) or OPC UA servers, with rising-edge (`LOW → HIGH`) detection on configurable PLC `BOOL` trigger tags (`BatchCompleted` and `BinLevelFull`).
+- **Operator Desktop & Web Monitoring UI:** Real-time visual status dashboard (Native Desktop GUI window + Web UI at `http://localhost:8050`) displaying OPC Server communication, PLC BOOL trigger states, database connectivity & live data capturing, and report generation status.
 - **Offline Mocking:** Features a built-in SQLite fallback and a mock data generator (`mock_db_setup.py`) to verify Excel report formatting without an active SQL Server connection.
 
 ---
@@ -87,7 +89,117 @@ You can set up SQLite in three ways:
    This queries the database for `2026-05-15 06:00:00` to `2026-05-15 14:00:00` and outputs the Excel report in `./reports`.
 
 2. **Interactive Windows Console Dashboard:**
-   Double-click [run_reporter.bat](file:///Users/rohitkumar/IdeaProjects/ReportGen-Plant/run_reporter.bat) for an interactive menu to initialize databases, populate mock data, run shift reports, or start background services.
+   Double-click [run_reporter.bat](file:///Users/rohitkumar/IdeaProjects/ReportGen-Plant/run_reporter.bat) for an interactive menu to initialize databases, populate mock data, run shift reports, launch the Operator Status Monitoring UI, or start background services.
+
+---
+
+## Operator Status & Communication Monitoring UI
+
+The application includes a visual **Operator Status & Communication Monitor** ([monitor_ui.py](file:///Users/rohitkumar/IdeaProjects/ReportGen-Plant/monitor_ui.py)) that runs both as a **Native Desktop Window (Tkinter)** and as a **Live Web Dashboard (`http://localhost:8050`)**.
+
+### 1. How to Launch the Monitoring UI
+
+- **Live Production Mode (OPC DA / OPC UA + Database + Report Scheduler):**
+  ```cmd
+  python main.py --ui
+  ```
+- **Simulation / Local Testing Mode (Simulated PLC & Rising-Edge Triggers):**
+  ```cmd
+  python main.py --ui --opc-sim
+  ```
+- **Via Windows Batch Menu ([run_reporter.bat](file:///Users/rohitkumar/IdeaProjects/ReportGen-Plant/run_reporter.bat)):**
+  Double-click `run_reporter.bat` and enter **`14`** (*Launch Operator Status Monitoring UI*).
+
+Once started:
+- **Native Desktop Window:** Opens automatically on the operator PC desktop.
+- **Web Browser Dashboard:** Open **http://localhost:8050** in any browser (Chrome, Edge, Safari).
+- **Live JSON Telemetry API:** Available at **http://localhost:8050/api/status**.
+
+---
+
+### 2. Visual Status Indicators Explained
+
+The monitoring screen is organized into three real-time status cards plus a live database verification table and communication log:
+
+1. **Card 1 — OPC Server Communication:**
+   - **Status Badge:**
+     - `● CONNECTED` (Green): Communicating live with the configured OPC Server (`ABB.AC800MC_OpcDaServer.3`).
+     - `● CONNECTED (SIMULATION)` (Blue): Running with the built-in PLC simulator.
+     - `● CONNECTING` (Amber) / `● DISCONNECTED` or `● ERROR` (Red): Indicates connection retry or OPC server unavailability.
+   - **PLC Rising-Edge BOOL Trigger Tag Pills (`BatchCompleted` & `BinLevelFull`):**
+     - Displays `○ BatchCompleted: LOW (0)` / `● BatchCompleted: HIGH (1)` and `○ BinLevelFull: LOW (0)` / `● BinLevelFull: HIGH (1)`.
+     - Shows the **Last Rising-Edge Trigger** tag name and exact timestamp whenever either tag transitions `LOW → HIGH`.
+
+2. **Card 2 — Database & Data Capturing:**
+   - **Status Badge:** `● CAPTURING` (Green), `● CONNECTED` (Green), or `● ERROR` (Red).
+   - Displays the active database engine (`SQL Server` or `SQLite`), database target, **Total Stored Records**, **Captured This Session** count, **Latest Captured Batch No.**, **Latest Capture Timestamp**, and **Last Database Write Status**.
+
+3. **Card 3 — Report Generation Status:**
+   - **Status Badge:** `● SCHEDULED` / `● READY` / `● SUCCESS` (Green), `● PROCESSING` (Amber), or `● ERROR` (Red).
+   - Shows whether the automated daily shift scheduler is active, the **Last Generated Shift**, **Last Report File**, generation timestamp, and number of rows exported.
+   - Provides one-click buttons (**`Shift A`**, **`Shift B`**, **`Shift C`**, **`Daily`**) to generate any report immediately.
+
+---
+
+### 3. How to Validate the UI & End-to-End Operation
+
+Follow this checklist to validate all three subsystems from the UI:
+
+#### Step A: Validate OPC Communication & Rising-Edge BOOL Triggers (`BatchCompleted` / `BinLevelFull`)
+1. Launch `python main.py --ui --opc-sim` and open **http://localhost:8050** (or view the desktop window).
+2. Confirm **Card 1 (OPC Server Communication)** shows `● CONNECTED (SIMULATION)` (or `● CONNECTED` in live mode) and the **Last Poll / Cycle Count** increments every polling cycle.
+3. Click **`Pulse BatchCompleted (LOW→HIGH)`** in the top toolbar:
+   - Verify the **`BatchCompleted`** indicator pill turns green (`● BatchCompleted: HIGH (1)`).
+   - Verify **Last Rising-Edge Trigger** updates to `BatchCompleted` with the current timestamp.
+   - Verify a new batch row immediately appears at the top of the **Latest Captured Batch Records in Database** table.
+4. Click **`Pulse BinLevelFull (LOW→HIGH)`** in the top toolbar:
+   - Verify the **`BinLevelFull`** indicator pill turns green (`● BinLevelFull: HIGH (1)`).
+   - Verify **Captured This Session** and **Total Stored Records** in **Card 2** increment by `1`, and the new batch number appears in the live table.
+
+#### Step B: Validate Database Connectivity & Captured Data
+1. In **Card 2 (Database & Data Capturing)**, confirm the badge shows `● CAPTURING` and **Last DB Write Status** shows `OK (Batch #<N>)`.
+2. Inspect the **Latest Captured Batch Records in Database** table in the lower panel to confirm all bin weights (`WST BQT H (1)`, `QTZ`, `WST BQT H (2)`, `AN COAL`, `WST BQT H (3)`, `HARFER COK`, `WST BQT L`, `WST FBL`) are populated for each captured batch.
+3. You can also cross-check from a terminal using:
+   ```cmd
+   python main.py --db-stats
+   sqlite3 -header -column mock_plant.db "SELECT * FROM batching_data ORDER BY batching_time DESC LIMIT 5;"
+   ```
+
+#### Step C: Validate Report Generation & Processing
+1. In **Card 3 (Report Generation Status)**, click **`Shift A`** (or **`Shift B`**, **`Shift C`**, **`Daily`**).
+2. Watch the Card 3 badge transition to `● PROCESSING` and then `● SUCCESS`.
+3. Confirm **Last Generated Shift**, **Last Report File** (e.g., `BatchingReport_Shift_A_<YYYYMMDD>.xlsx`), and the exported row count update in Card 3 and in the **Live Communication, Trigger & Report Processing Log** at the bottom of the screen.
+4. Click **`Open Reports Folder`** in the desktop toolbar (or check `./reports`) to open the generated `.xlsx` file.
+
+#### Step D: Validate via JSON Status API
+You can query the live telemetry endpoint from PowerShell or `curl` to verify automated monitoring:
+```cmd
+curl http://localhost:8050/api/status
+```
+
+---
+
+## PLC Rising-Edge BOOL Trigger Configuration (`config.yaml`)
+
+Under the `opc:` section of [config.yaml](file:///Users/rohitkumar/IdeaProjects/ReportGen-Plant/config.yaml#L168-L181), two configurable PLC `BOOL` trigger tags (`BatchCompleted` and `BinLevelFull`) control automatic database data capture:
+
+```yaml
+opc:
+  enabled: true
+  protocol: "opc_da"
+  server: "ABB.AC800MC_OpcDaServer.3"
+  host: "localhost"
+  polling_interval_seconds: 10
+
+  # Rising-edge trigger mode: writes a new row whenever any configured BOOL tag transitions LOW (0) -> HIGH (1)
+  trigger_mode: "trigger_tag"
+
+  trigger_tags:
+    batch_completed: "BatchCompleted"
+    bin_level_full: "BinLevelFull"
+```
+- Whenever **either** `batch_completed` **or** `bin_level_full` transitions from `LOW` (`0` / `False`) to `HIGH` (`1` / `True`), the collector captures all mapped bin values at that moment and inserts a new row into `batching_data`.
+- If your ABB PLC exposes these tags under an application path (for example `Applications.Application_1.BatchCompleted.Value`), update the tag names under `trigger_tags` in `config.yaml`.
 
 ---
 

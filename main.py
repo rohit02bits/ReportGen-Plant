@@ -87,6 +87,7 @@ Examples:
     parser.add_argument("--dry-run", action="store_true", help="Use with --service to test scheduler setup without waiting")
     parser.add_argument("--collect-opc", action="store_true", help="Start the continuous OPC DA data collection service")
     parser.add_argument("--opc-sim", action="store_true", help="Force OPC DA client into simulation/mock mode")
+    parser.add_argument("--ui", action="store_true", help="Launch the Desktop Operator Status & Communication Monitoring UI")
     parser.add_argument("--init-db", action="store_true", help="Initialize database schema, tables, and indexes")
     parser.add_argument("--mock-data", action="store_true", help="Generate and insert mock plant batch data into the connected database")
     parser.add_argument("--mock-days", type=int, default=7, help="Number of past days for mock data generation (default: 7)")
@@ -178,6 +179,11 @@ Examples:
             
     elif args.service:
         scheduler.start_service_mode(dry_run=args.dry_run)
+
+    elif args.ui:
+        from monitor_ui import launch_operator_ui
+        logger.info("Launching Desktop Operator Monitoring UI...")
+        launch_operator_ui(config, auto_start_services=True, force_opc_sim=args.opc_sim)
 
     elif args.collect_opc:
         from opc_collector import OPCCollector

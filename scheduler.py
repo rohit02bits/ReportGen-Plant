@@ -4,6 +4,7 @@ import schedule
 from datetime import datetime, date, timedelta
 from db_client import DatabaseClient
 from report_generator import ReportGenerator
+from monitor_ui import get_status_tracker
 
 logger = logging.getLogger("ReportGenerator.Scheduler")
 
@@ -13,6 +14,7 @@ class Scheduler:
         self.db_client = DatabaseClient(config)
         self.report_gen = ReportGenerator(config)
         self.shifts = config.get("shifts", [])
+        self.tracker = get_status_tracker()
 
     def calculate_shift_window(self, shift_def, run_date: date):
         """
@@ -61,6 +63,11 @@ class Scheduler:
         logger.info(f"Report coverage window: {start_dt} to {end_dt}")
 
         try:
+            self.tracker.update_reporting(
+                state="PROCESSING",
+                active_shift=shift_def["name"],
+                message=f"Generating '{shift_def['name']}' report ({start_dt} to {end_dt})...",
+            )
             # Query data
             df = self.db_client.get_batching_data(start_dt, end_dt)
             if df.empty:
@@ -72,9 +79,23 @@ class Scheduler:
             # Generate excel
             filepath = self.report_gen.generate_excel_report(shift_def["name"], start_dt, end_dt, df)
             logger.info(f"Successfully generated report for '{shift_def['name']}': {filepath}")
+            self.tracker.update_reporting(
+                state="SUCCESS",
+                active_shift="-",
+                last_report_shift=shift_def["name"],
+                last_report_file=filepath,
+                last_report_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                last_report_rows=len(df),
+                message=f"Generated '{shift_def['name']}' report ({len(df)} records) -> {filepath}",
+            )
             return filepath
         except Exception as e:
             logger.error(f"Failed to generate report for shift '{shift_name}': {e}", exc_info=True)
+            self.tracker.update_reporting(
+                state="ERROR",
+                active_shift="-",
+                message=f"Failed generating '{shift_name}' report: {e}",
+            )
             raise e
 
     def find_current_due_shift(self, current_time: datetime = None):

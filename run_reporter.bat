@@ -29,10 +29,11 @@ echo  10. View Connected Database Status & Record Counts
 echo  11. Start OPC DA Data Collector (Production/Live)
 echo  12. Start OPC DA Data Collector (Simulation Mode)
 echo  13. Stream Live Mock Batches into DB (Continuous test generator)
-echo  14. Exit
+echo  14. Launch Operator Status Monitoring UI (Desktop Dashboard)
+echo  15. Exit
 echo.
 echo ===================================================
-set /p choice="Enter choice (1-14): "
+set /p choice="Enter choice (1-15): "
 
 if "%choice%"=="1" goto shift_a
 if "%choice%"=="2" goto shift_b
@@ -47,7 +48,8 @@ if "%choice%"=="10" goto db_status
 if "%choice%"=="11" goto opc_collect
 if "%choice%"=="12" goto opc_sim
 if "%choice%"=="13" goto mock_stream
-if "%choice%"=="14" goto exit
+if "%choice%"=="14" goto monitor_ui
+if "%choice%"=="15" goto exit
 echo Invalid choice. Please try again.
 pause
 goto menu
@@ -149,6 +151,13 @@ echo Streaming continuous mock batches into database (every 10s)...
 echo Close this window or press Ctrl+C to stop.
 echo.
 python mock_db_setup.py --stream --interval 10
+pause
+goto menu
+
+:monitor_ui
+echo.
+echo Launching Desktop Operator Status Monitoring UI...
+%RUNNER% --ui
 pause
 goto menu
 

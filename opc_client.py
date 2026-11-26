@@ -175,20 +175,25 @@ class OPCClient:
         Generates candidate OPC DA ItemIDs for a configured tag.
         If the user prefixed the tag with the OPC Server ProgID (e.g.
         'ABB.AC800MC_OpcDaServer.3.Applications.Application_1.AI1.Value'),
-        also tries stripping the server ProgID prefix ('Applications.Application_1.AI1.Value').
+        prioritizes the stripped ItemID ('Applications.Application_1.AI1.Value') first.
         """
-        candidates = [tag]
+        candidates = []
         prefixes = []
         if self.connected_da_server:
             prefixes.append(self.connected_da_server + ".")
         if self.server_name and (self.server_name + ".") not in prefixes:
             prefixes.append(self.server_name + ".")
+        for alt in ("ABB.AC800MC_OpcDaServer.3.", "ABB.AC800MOPCDAServer.4.", "ABB.AC800MC_OpcDaServer."):
+            if alt not in prefixes:
+                prefixes.append(alt)
 
         for pfx in prefixes:
             if tag.lower().startswith(pfx.lower()):
                 stripped = tag[len(pfx):]
                 if stripped and stripped not in candidates:
                     candidates.append(stripped)
+        if tag not in candidates:
+            candidates.append(tag)
         return candidates
 
     def _format_opc_error(self, err):
@@ -562,165 +567,228 @@ class OPCClient:
 
     def _connect_opc_da_wow64_bridge(self, candidates, is_local, diagnostic_errors):
         """
-        Spawns a persistent 32-bit Windows Script Host (SysWOW64\\cscript.exe VBScript) or
-        32-bit PowerShell worker to run 32-bit OPCDAAuto.dll in-process without cross-bitness
-        COM marshaling issues.
+        Spawns a persistent 32-bit Windows PowerShell (SysWOW64) worker using C# Reflection
+        with 1-based SAFEARRAYs to call OPCItems.AddItems and OPCGroup.SyncRead in-process,
+        completely avoiding COPCItem (E_NOINTERFACE -2147467262).
         """
         sys_root = os.environ.get("SystemRoot", r"C:\Windows")
-        cscript32_path = os.path.join(sys_root, "SysWOW64", "cscript.exe")
-        if not os.path.exists(cscript32_path):
-            cscript32_path = "cscript.exe"
+        ps32_path = os.path.join(sys_root, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe")
+        if not os.path.exists(ps32_path):
+            ps32_path = "powershell.exe"
 
-        vbs_script = r'''
-Option Explicit
-On Error Resume Next
+        ps_script = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Reflection;
 
-Function JsonEscape(s)
-    Dim res, q
-    q = Chr(34)
-    res = CStr(s)
-    res = Replace(res, "\", "\\")
-    res = Replace(res, q, "\" & q)
-    res = Replace(res, vbCr, "")
-    res = Replace(res, vbLf, " ")
-    JsonEscape = res
-End Function
+public static class OpcDaSyncHelper {
+    public static int AddSingleItem(object opcItems, string itemId, int clientHandle, out int errCode) {
+        errCode = -1;
+        Array itemIds = Array.CreateInstance(typeof(string), new int[] { 1 }, new int[] { 1 });
+        itemIds.SetValue(itemId, 1);
+        Array clientHandles = Array.CreateInstance(typeof(int), new int[] { 1 }, new int[] { 1 });
+        clientHandles.SetValue(clientHandle, 1);
+        Array serverHandles = null;
+        Array errors = null;
 
-Dim fso, shell, env
-Set fso = CreateObject("Scripting.FileSystemObject")
-Set shell = CreateObject("WScript.Shell")
-Set env = shell.Environment("PROCESS")
+        object[] args = new object[] { 1, itemIds, clientHandles, serverHandles, errors, Type.Missing, Type.Missing };
+        ParameterModifier pMod = new ParameterModifier(7);
+        pMod[3] = true;
+        pMod[4] = true;
 
-Dim wrappers, w, opc, usedWrapper
-wrappers = Array("OPC.Automation", "OPC.Automation.1", "Graybox.OPC.DAWrapper", "Graybox.OPC.DAWrapper.1", "Matrikon.OPC.Automation", "ABB.OPC.Automation", "RSI.OPCAutomation", "HSCOPC.Automation")
-Set opc = Nothing
-usedWrapper = ""
+        opcItems.GetType().InvokeMember(
+            "AddItems",
+            BindingFlags.InvokeMethod,
+            null,
+            opcItems,
+            args,
+            new ParameterModifier[] { pMod },
+            null,
+            null
+        );
 
-For Each w In wrappers
-    Err.Clear
-    Set opc = CreateObject(w)
-    If Err.Number = 0 And Not (opc Is Nothing) Then
-        usedWrapper = w
-        Exit For
-    End If
-Next
+        serverHandles = (Array)args[3];
+        errors = (Array)args[4];
+        if (errors != null && errors.Length >= 1) {
+            int lb = errors.GetLowerBound(0);
+            errCode = Convert.ToInt32(errors.GetValue(lb));
+        }
+        if (errCode == 0 && serverHandles != null && serverHandles.Length >= 1) {
+            int lb = serverHandles.GetLowerBound(0);
+            return Convert.ToInt32(serverHandles.GetValue(lb));
+        }
+        return 0;
+    }
 
-If opc Is Nothing Then
-    WScript.StdOut.WriteLine "{""status"":""error"",""error"":""32-bit cscript could not load OPC.Automation wrapper""}"
-    WScript.Quit 1
-End If
+    public static object[] SyncReadItems(object opcGroup, int[] srvHandles, out int[] errCodes) {
+        int n = srvHandles.Length;
+        errCodes = new int[n];
+        object[] resultVals = new object[n];
+        if (n == 0) return resultVals;
 
-Dim candidatesRaw, candidates, srv, hostName, isLocal, connectedServer, connErr
-candidatesRaw = env("OPC_CANDIDATES_CSV")
-candidates = Split(candidatesRaw, "|")
-hostName = env("OPC_HOST")
-isLocal = (env("OPC_IS_LOCAL") = "1")
-connectedServer = ""
-connErr = ""
+        Array handlesArr = Array.CreateInstance(typeof(int), new int[] { n }, new int[] { 1 });
+        for (int i = 0; i < n; i++) {
+            handlesArr.SetValue(srvHandles[i], i + 1);
+        }
+        Array values = null;
+        Array errors = null;
+        object qualities = Type.Missing;
+        object timestamps = Type.Missing;
 
-For Each srv In candidates
-    If Len(Trim(srv)) > 0 Then
-        Err.Clear
-        If isLocal Then
-            opc.Connect Trim(srv)
-            If Err.Number <> 0 Then
-                Err.Clear
-                opc.Connect Trim(srv), hostName
-            End If
-        Else
-            opc.Connect Trim(srv), hostName
-        End If
-        If Err.Number = 0 Then
-            connectedServer = Trim(srv)
-            Exit For
-        Else
-            connErr = connErr & srv & ": " & Err.Description & " (" & Err.Number & "); "
-        End If
-    End If
-Next
+        object[] args = new object[] { (short)2, n, handlesArr, values, errors, qualities, timestamps };
+        ParameterModifier pMod = new ParameterModifier(7);
+        pMod[3] = true;
+        pMod[4] = true;
 
-If connectedServer = "" Then
-    WScript.StdOut.WriteLine "{""status"":""error"",""error"":""" & JsonEscape(connErr) & """}"
-    WScript.Quit 1
-End If
+        opcGroup.GetType().InvokeMember(
+            "SyncRead",
+            BindingFlags.InvokeMethod,
+            null,
+            opcGroup,
+            args,
+            new ParameterModifier[] { pMod },
+            null,
+            null
+        );
 
-Dim grp, opcItems, itemsDict, handleSeq
-Err.Clear
-Set grp = opc.OPCGroups.Add("ReportGenVbsGroup")
-grp.IsActive = True
-Set opcItems = grp.OPCItems
-Set itemsDict = CreateObject("Scripting.Dictionary")
-handleSeq = 1
+        values = (Array)args[3];
+        errors = (Array)args[4];
+        int vLb = values != null ? values.GetLowerBound(0) : 1;
+        int eLb = errors != null ? errors.GetLowerBound(0) : 1;
+        for (int i = 0; i < n; i++) {
+            if (values != null && i < values.Length) resultVals[i] = values.GetValue(vLb + i);
+            if (errors != null && i < errors.Length) errCodes[i] = Convert.ToInt32(errors.GetValue(eLb + i));
+        }
+        return resultVals;
+    }
+}
+"@
 
-WScript.StdOut.WriteLine "{""status"":""connected"",""wrapper"":""" & JsonEscape(usedWrapper) & """,""server"":""" & JsonEscape(connectedServer) & """}"
+$wrappers = @('OPC.Automation', 'OPC.Automation.1', 'Graybox.OPC.DAWrapper', 'Graybox.OPC.DAWrapper.1', 'Matrikon.OPC.Automation', 'ABB.OPC.Automation', 'RSI.OPCAutomation', 'HSCOPC.Automation')
+$opc = $null
+$usedWrapper = $null
+foreach ($w in $wrappers) {
+    try {
+        $opc = New-Object -ComObject $w
+        $usedWrapper = $w
+        break
+    } catch {}
+}
+if ($null -eq $opc) {
+    Write-Output (@{ status = 'error'; error = '32-bit PowerShell could not instantiate OPC.Automation' } | ConvertTo-Json -Compress)
+    exit 1
+}
 
-Dim line, tagsArr, t, cleanTag, stripPrefix, itemObj, valStr, errPairs, valPairs
-stripPrefix = LCase(connectedServer & ".")
+$candidates = $env:OPC_CANDIDATES_CSV -split '\|'
+$hostName = $env:OPC_HOST
+$isLocal = ($env:OPC_IS_LOCAL -eq '1')
+$connectedServer = $null
+$connErrors = @()
 
-Do While Not WScript.StdIn.AtEndOfStream
-    line = Trim(WScript.StdIn.ReadLine())
-    If line = "QUIT" Or line = "" Then Exit Do
-    If Left(line, 5) = "READ:" Then
-        tagsArr = Split(Mid(line, 6), "|")
-        valPairs = ""
-        errPairs = ""
-        For Each t In tagsArr
-            If Len(t) > 0 Then
-                Err.Clear
-                If Not itemsDict.Exists(t) Then
-                    Set itemObj = Nothing
-                    Set itemObj = opcItems.AddItem(t, handleSeq)
-                    If Err.Number <> 0 And LCase(Left(t, Len(stripPrefix))) = stripPrefix Then
-                        Err.Clear
-                        cleanTag = Mid(t, Len(stripPrefix) + 1)
-                        Set itemObj = opcItems.AddItem(cleanTag, handleSeq)
-                    End If
-                    If Err.Number = 0 And Not (itemObj Is Nothing) Then
-                        handleSeq = handleSeq + 1
-                        Set itemsDict(t) = itemObj
-                    End If
-                End If
+foreach ($srv in $candidates) {
+    if (-not $srv) { continue }
+    try {
+        if ($isLocal) {
+            try { $opc.Connect($srv) } catch { $opc.Connect($srv, $hostName) }
+        } else {
+            $opc.Connect($srv, $hostName)
+        }
+        $connectedServer = $srv
+        break
+    } catch {
+        $connErrors += "$srv : $($_.Exception.Message)"
+    }
+}
 
-                If itemsDict.Exists(t) Then
-                    Err.Clear
-                    Set itemObj = itemsDict(t)
-                    itemObj.Read 2
-                    Err.Clear
-                    Dim v
-                    v = itemObj.Value
-                    If Err.Number = 0 And Not IsNull(v) And Not IsEmpty(v) Then
-                        If IsNumeric(v) Then
-                            valStr = Replace(CStr(CDbl(v)), ",", ".")
-                        ElseIf VarType(v) = vbBoolean Then
-                            If v Then valStr = "1" Else valStr = "0"
-                        Else
-                            valStr = """" & JsonEscape(CStr(v)) & """"
-                        End If
-                    Else
-                        valStr = "null"
-                    End If
-                Else
-                    valStr = "null"
-                    errPairs = errPairs & """" & JsonEscape(t) & """:""" & JsonEscape(Err.Description & " (" & Err.Number & ")") & ""","
-                End If
-                valPairs = valPairs & """" & JsonEscape(t) & """:" & valStr & ","
-            End If
-        Next
-        If Right(valPairs, 1) = "," Then valPairs = Left(valPairs, Len(valPairs) - 1)
-        If Right(errPairs, 1) = "," Then errPairs = Left(errPairs, Len(errPairs) - 1)
-        WScript.StdOut.WriteLine "{""status"":""ok"",""values"":{" & valPairs & "},""errors"":{" & errPairs & "}}"
-    End If
-Loop
+if ($null -eq $connectedServer) {
+    Write-Output (@{ status = 'error'; error = ($connErrors -join '; ') } | ConvertTo-Json -Compress)
+    exit 1
+}
 
-opc.Disconnect
+$group = $opc.OPCGroups.Add('ReportGenWow64Group')
+$group.IsActive = $true
+$opcItems = $group.OPCItems
+$handlesMap = @{}
+$handleSeq = 1
+$stripPrefix = ($connectedServer + '.').ToLower()
+
+Write-Output (@{ status = 'connected'; wrapper = $usedWrapper; server = $connectedServer } | ConvertTo-Json -Compress)
+
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line -or $line.Trim() -eq 'QUIT' -or $line.Trim() -eq '') { break }
+    if ($line.StartsWith('READ:')) {
+        $tags = $line.Substring(5) -split '\|'
+        $valsOut = @{}
+        $errsOut = @{}
+        $validTags = New-Object System.Collections.Generic.List[string]
+        $validHandles = New-Object System.Collections.Generic.List[int]
+
+        foreach ($t in $tags) {
+            if (-not $t) { continue }
+            if (-not $handlesMap.ContainsKey($t)) {
+                $candList = New-Object System.Collections.Generic.List[string]
+                if ($t.ToLower().StartsWith($stripPrefix)) {
+                    $candList.Add($t.Substring($stripPrefix.Length))
+                }
+                $candList.Add($t)
+                $addedHandle = 0
+                $lastErr = -1
+                foreach ($c in $candList) {
+                    try {
+                        $errCode = 0
+                        $h = [OpcDaSyncHelper]::AddSingleItem($opcItems, $c, $handleSeq, [ref]$errCode)
+                        if ($errCode -eq 0 -and $h -ne 0) {
+                            $addedHandle = $h
+                            $handleSeq += 1
+                            break
+                        }
+                        $lastErr = $errCode
+                    } catch {
+                        $lastErr = $_.Exception.Message
+                    }
+                }
+                if ($addedHandle -ne 0) {
+                    $handlesMap[$t] = $addedHandle
+                } else {
+                    $valsOut[$t] = $null
+                    $errsOut[$t] = "$lastErr"
+                }
+            }
+            if ($handlesMap.ContainsKey($t)) {
+                $validTags.Add($t)
+                $validHandles.Add([int]$handlesMap[$t])
+            }
+        }
+
+        if ($validTags.Count -gt 0) {
+            try {
+                $readErrs = $null
+                $readVals = [OpcDaSyncHelper]::SyncReadItems($group, $validHandles.ToArray(), [ref]$readErrs)
+                for ($i = 0; $i -lt $validTags.Count; $i++) {
+                    $tagKey = $validTags[$i]
+                    if ($readErrs[$i] -eq 0) {
+                        $valsOut[$tagKey] = $readVals[$i]
+                    } else {
+                        $valsOut[$tagKey] = $null
+                        $errsOut[$tagKey] = "SyncRead error $($readErrs[$i])"
+                    }
+                }
+            } catch {
+                foreach ($tagKey in $validTags) {
+                    $valsOut[$tagKey] = $null
+                    $errsOut[$tagKey] = $_.Exception.Message
+                }
+            }
+        }
+        Write-Output (@{ status = 'ok'; values = $valsOut; errors = $errsOut } | ConvertTo-Json -Compress)
+    }
+}
+try { $opc.Disconnect() } catch {}
 '''
         try:
-            logger.info("Starting 32-bit WOW64 in-process OPC DA bridge (SysWOW64\\cscript.exe)...")
-            import tempfile
-            vbs_file = os.path.join(tempfile.gettempdir(), f"opc_da_bridge_{os.getpid()}.vbs")
-            with open(vbs_file, "w", encoding="utf-8") as f:
-                f.write(vbs_script)
-
+            logger.info("Starting 32-bit WOW64 in-process OPC DA SyncRead bridge...")
             env = os.environ.copy()
             env["OPC_CANDIDATES_CSV"] = "|".join(candidates)
             env["OPC_HOST"] = self.host
@@ -728,7 +796,7 @@ opc.Disconnect
 
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.Popen(
-                [cscript32_path, "//NoLogo", vbs_file],
+                [ps32_path, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -741,7 +809,7 @@ opc.Disconnect
             if not first_line:
                 stderr_out = proc.stderr.read().strip()
                 proc.terminate()
-                diagnostic_errors.append(f"WOW64Bridge: {stderr_out or 'No output from 32-bit cscript'}")
+                diagnostic_errors.append(f"WOW64Bridge: {stderr_out or 'No output from 32-bit PowerShell'}")
                 return False
 
             resp = json.loads(first_line.strip())
@@ -752,7 +820,7 @@ opc.Disconnect
                 self.connected = True
                 logger.info(
                     f"Successfully connected to OPC DA Server '{resp.get('server')}' "
-                    f"via 32-bit WOW64 In-Process Bridge (Wrapper: {resp.get('wrapper')})."
+                    f"via 32-bit WOW64 In-Process SyncRead Bridge (Wrapper: {resp.get('wrapper')})."
                 )
                 return True
             else:
@@ -927,15 +995,19 @@ opc.Disconnect
 
         for candidate in self._candidate_tag_names(tag):
             try:
+                # Note: pywin32 InvokeTypes requires an argument for every entry in ADD_ITEMS_ARG_TYPES (7 total),
+                # passing pythoncom.Missing for the two [out] parameters (ServerHandles, Errors) and two [in, optional] parameters.
                 res = opc_items._oleobj_.InvokeTypes(
                     dispid_add_items,
                     0,
                     1,  # pythoncom.DISPATCH_METHOD
-                    (0, 0),
+                    (24, 0),
                     self.ADD_ITEMS_ARG_TYPES,
                     1,
                     ["", candidate],
                     [0, int(client_handle)],
+                    pythoncom.Missing,
+                    pythoncom.Missing,
                     pythoncom.Missing,
                     pythoncom.Missing,
                 )
@@ -958,6 +1030,7 @@ opc.Disconnect
         Calls OPCGroup.SyncRead via InvokeTypes for a list of integer server_handles.
         Returns (values_list, errors_list). Never touches COPCItem interfaces.
         """
+        import pythoncom
         dispid_sync_read = opc_group._oleobj_.GetIDsOfNames("SyncRead")
         num_items = len(server_handles)
         handles_arr = [0] + [int(h) for h in server_handles]
@@ -966,21 +1039,24 @@ opc.Disconnect
         last_err = None
         for source in (2, 1):
             try:
+                # Pass all 7 positional args matching SYNC_READ_ARG_TYPES (including pythoncom.Missing for the 4 [out] args)
                 res = opc_group._oleobj_.InvokeTypes(
                     dispid_sync_read,
                     0,
                     1,  # pythoncom.DISPATCH_METHOD
-                    (0, 0),
+                    (24, 0),
                     self.SYNC_READ_ARG_TYPES,
                     source,
                     num_items,
                     handles_arr,
+                    pythoncom.Missing,
+                    pythoncom.Missing,
+                    pythoncom.Missing,
+                    pythoncom.Missing,
                 )
                 if isinstance(res, tuple) and len(res) >= 2:
                     raw_vals = list(res[0]) if res[0] is not None else []
                     raw_errs = list(res[1]) if res[1] is not None else []
-                    # OPCDAAuto returns 1-based SAFEARRAY converted by pywin32 to a tuple of length num_items
-                    # (or num_items + 1 if 0-based). Slice the last num_items elements:
                     vals = raw_vals[-num_items:] if len(raw_vals) >= num_items else raw_vals
                     errs = raw_errs[-num_items:] if len(raw_errs) >= num_items else raw_errs
                     return vals, errs
@@ -1100,21 +1176,45 @@ opc.Disconnect
     # Simulation Engine Methods
     # =========================================================================
 
+    def _get_configured_trigger_tags(self):
+        """Returns list of all configured BOOL trigger tags for simulation."""
+        raw = self.opc_config.get("trigger_tags")
+        tags = []
+        if isinstance(raw, dict):
+            for _, v in raw.items():
+                if v and str(v).strip() and str(v).strip() not in tags:
+                    tags.append(str(v).strip())
+        elif isinstance(raw, list):
+            for v in raw:
+                if v and str(v).strip() and str(v).strip() not in tags:
+                    tags.append(str(v).strip())
+        single = self.opc_config.get("trigger_tag")
+        if single and str(single).strip() and str(single).strip() not in tags:
+            tags.append(str(single).strip())
+        if not tags:
+            tags = ["BatchCompleted", "BinLevelFull"]
+        return tags
+
     def _update_simulation(self):
-        """Simulates progress of a physical batching process."""
+        """Simulates progress of a physical batching process including rising-edge BOOL triggers."""
         now = time.time()
         elapsed = now - self.sim_last_update
+        trigger_tags = self._get_configured_trigger_tags()
 
         if elapsed >= self.sim_interval:
             self.sim_batch_no += 1
             self.sim_last_update = now
-            self.sim_tags_cache = self._generate_simulated_tags()
+            self.sim_tags_cache = self._generate_simulated_tags(trigger_high=True)
             logger.info(f"[OPC Simulation] New batch generated! Batch No: {self.sim_batch_no}")
+        else:
+            # Reset trigger tags to LOW (False) after trigger pulse window
+            for t in trigger_tags:
+                self.sim_tags_cache[t] = False
 
-    def _generate_simulated_tags(self):
+    def _generate_simulated_tags(self, trigger_high=False):
         """Generates realistic random values for simulated ABB drive tags."""
         mappings = self.opc_config.get("tag_mappings", {})
-        trigger_tag = self.opc_config.get("trigger_tag", "ABB_Drive.BatchComplete")
+        trigger_tags = self._get_configured_trigger_tags()
 
         sim_vals = {
             mappings.get("batch_no", "ABB_Drive.BatchNo"): self.sim_batch_no,
@@ -1133,13 +1233,13 @@ opc.Disconnect
             ]), 2),
             mappings.get("wst_bqt_l", "ABB_Drive.WstBqtL"): round(random.uniform(645.0, 660.0), 2),
             mappings.get("wst_fbl", "ABB_Drive.WstFbl"): round(random.uniform(245.0, 260.0), 2),
-            trigger_tag: 0
         }
 
-        now = time.time()
-        elapsed = now - getattr(self, 'sim_last_update', now)
-        sim_interval = getattr(self, 'sim_interval', 15)
-        if sim_interval - elapsed <= 3:
-            sim_vals[trigger_tag] = 1
+        for t in trigger_tags:
+            sim_vals[t] = False
+
+        if trigger_high and trigger_tags:
+            active_tag = random.choice(trigger_tags)
+            sim_vals[active_tag] = True
 
         return sim_vals

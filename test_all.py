@@ -197,11 +197,87 @@ class TestPlantBatchingSystem(unittest.TestCase):
         self.assertIn("ABB.DriveOPC", candidates)
         self.assertTrue(client._is_local_host())
 
-        # Verify automatic stripping of server ProgID prefix from tag names
+        # Verify automatic stripping of server ProgID prefix from tag names (prioritizes stripped tag first)
         prefixed_tag = "ABB.AC800MC_OpcDaServer.3.Applications.Application_1.AI1.Value"
         tag_candidates = client._candidate_tag_names(prefixed_tag)
-        self.assertEqual(tag_candidates[0], prefixed_tag)
-        self.assertIn("Applications.Application_1.AI1.Value", tag_candidates)
+        self.assertEqual(tag_candidates[0], "Applications.Application_1.AI1.Value")
+        self.assertIn(prefixed_tag, tag_candidates)
+
+    def test_dual_bool_rising_edge_triggers(self):
+        """Test that BatchCompleted or BinLevelFull LOW -> HIGH transitions each trigger a DB row insert."""
+        collector = OPCCollector(self.config, force_simulation=True)
+        collector.db_client.use_sqlite = True
+        collector.last_batch_no = 5000
+
+        self.assertIn("BatchCompleted", collector.trigger_tags)
+        self.assertIn("BinLevelFull", collector.trigger_tags)
+
+        base_tags = {
+            self.config["opc"]["tag_mappings"]["batch_no"]: None,
+            self.config["opc"]["tag_mappings"]["wst_bqt_h_1"]: 701.25,
+            self.config["opc"]["tag_mappings"]["qtz"]: 255.50,
+            "BatchCompleted": False,
+            "BinLevelFull": False,
+        }
+
+        # 1. Baseline poll: both LOW (False) -> no insert
+        collector._process_trigger_tag(dict(base_tags))
+        self.assertEqual(collector.last_batch_no, 5000)
+
+        # 2. BatchCompleted transitions LOW -> HIGH (False -> True) -> inserts batch 5001
+        cycle2 = dict(base_tags, BatchCompleted=True)
+        collector._process_trigger_tag(cycle2)
+        self.assertEqual(collector.last_batch_no, 5001)
+
+        # 3. BatchCompleted stays HIGH (True -> True) -> no duplicate insert
+        collector._process_trigger_tag(cycle2)
+        self.assertEqual(collector.last_batch_no, 5001)
+
+        # 4. BatchCompleted returns LOW, BinLevelFull transitions LOW -> HIGH (0 -> 1) -> inserts batch 5002
+        cycle4 = dict(base_tags, BatchCompleted=False, BinLevelFull=1)
+        collector._process_trigger_tag(cycle4)
+        self.assertEqual(collector.last_batch_no, 5002)
+
+        # 5. Verify both rows (5001 and 5002) exist in SQLite with the captured bin values
+        df = collector.db_client.get_batching_data(
+            datetime.now() - timedelta(minutes=5),
+            datetime.now() + timedelta(minutes=5),
+        )
+        self.assertTrue((df["batch_no"] == 5001).any())
+        self.assertTrue((df["batch_no"] == 5002).any())
+
+    def test_status_tracker_and_monitor_ui_telemetry(self):
+        """Test that SystemStatusTracker accurately records OPC, Database, and Report status updates."""
+        from monitor_ui import get_status_tracker, OperatorMonitorUI
+
+        tracker = get_status_tracker()
+        tracker.update_opc(
+            state="CONNECTED",
+            protocol="opc_da_win32",
+            server="ABB.AC800MC_OpcDaServer.3",
+            trigger_tags={"BatchCompleted": 1, "BinLevelFull": 0},
+            last_triggered_by="BatchCompleted",
+        )
+        tracker.record_db_capture(batch_no=6001, batch_time_str="2026-11-26 21:40:00", engine_label="SQLite")
+
+        sched = Scheduler(self.config)
+        sched.db_client.use_sqlite = True
+        filepath = sched.run_shift_report("Shift A", date(2026, 5, 15))
+        self.assertTrue(os.path.exists(filepath))
+
+        snap = tracker.get_snapshot()
+        self.assertEqual(snap["opc"]["state"], "CONNECTED")
+        self.assertEqual(snap["opc"]["last_triggered_by"], "BatchCompleted")
+        self.assertEqual(snap["database"]["state"], "CAPTURING")
+        self.assertEqual(snap["database"]["last_batch_no"], 6001)
+        self.assertEqual(snap["reporting"]["state"], "SUCCESS")
+        self.assertEqual(snap["reporting"]["last_report_shift"], "Shift A")
+
+        ui = OperatorMonitorUI(self.config, auto_start_services=False)
+        ui.db_client.use_sqlite = True
+        rows = ui.probe_database_status()
+        self.assertIsInstance(rows, list)
+        self.assertGreater(len(rows), 0)
 
 if __name__ == "__main__":
     unittest.main()

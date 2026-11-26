@@ -166,11 +166,18 @@ opc:
   polling_interval_seconds: 10
   
   # Trigger configuration:
-  # - trigger_mode: "batch_no_change" (writes when batch_no tag increments)
-  #                 "trigger_tag" (writes when trigger_tag transitions from 0 to 1)
+  # - trigger_mode: "trigger_tag" (writes on rising-edge LOW -> HIGH transition of any configured trigger tag)
+  #                 "batch_no_change" (writes when batch_no tag increments)
   #                 "periodic" (writes data at polling_interval_seconds)
-  trigger_mode: "periodic"
-  trigger_tag: "ABB_Drive.BatchComplete"
+  trigger_mode: "trigger_tag"
+  
+  # Two BOOL-type PLC tags for rising-edge (LOW -> HIGH) trigger detection.
+  # Whenever either BatchCompleted OR BinLevelFull transitions from LOW (0/False) to HIGH (1/True),
+  # a new row is automatically inserted into the database capturing current bin values.
+  trigger_tags:
+    batch_completed: "BatchCompleted"
+    bin_level_full: "BinLevelFull"
+  trigger_tag: "BatchCompleted"  # Legacy fallback single trigger tag
   
   # Tag mapping for the SQL Server table columns
   tag_mappings:
